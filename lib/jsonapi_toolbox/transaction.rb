@@ -1,13 +1,17 @@
 # frozen_string_literal: true
 
 require "singleton"
+require "json_api_client"
 
 require "jsonapi_toolbox/transaction/errors"
 require "jsonapi_toolbox/transaction/held_transaction"
 require "jsonapi_toolbox/transaction/manager"
+require "jsonapi_toolbox/transaction/serializer"
 require "jsonapi_toolbox/controller/transaction_aware"
+require "jsonapi_toolbox/controller/transactions_actions"
 require "jsonapi_toolbox/client/service_token_middleware"
-require "jsonapi_toolbox/client/transaction_client"
+require "jsonapi_toolbox/client/base"
+require "jsonapi_toolbox/client/transaction"
 
 module JsonapiToolbox
   module Transaction
