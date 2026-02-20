@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require "faraday"
+
 module JsonapiToolbox
   module Client
     class ServiceTokenMiddleware < Faraday::Middleware
