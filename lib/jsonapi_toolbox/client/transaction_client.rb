@@ -91,7 +91,7 @@ module JsonapiToolbox
       private
 
       def transactions_path
-        "/transactions"
+        "transactions"
       end
 
       def connection
