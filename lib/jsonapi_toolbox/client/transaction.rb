@@ -48,16 +48,25 @@ module JsonapiToolbox
       #   end
       #
       def self.within_transaction(timeout_seconds: nil)
+        # Re-entrant: if we're already inside a remote transaction on this
+        # thread, just yield into the existing one (no extra round trip).
+        if Thread.current[:jsonapi_toolbox_transaction_id]
+          return yield
+        end
+
         txn = create(timeout_seconds: timeout_seconds)
         raise_on_create_errors!(txn)
 
         begin
+          Thread.current[:jsonapi_toolbox_transaction_id] = txn.id
           result = with_headers("X-Transaction-ID" => txn.id) { yield txn }
           txn.commit!
           result
         rescue StandardError
           txn.rollback! rescue nil
           raise
+        ensure
+          Thread.current[:jsonapi_toolbox_transaction_id] = nil
         end
       end
 
