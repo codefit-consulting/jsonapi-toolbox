@@ -209,6 +209,31 @@ V1::Hotel.with_headers("X-Custom" => "value") do
 end
 ```
 
+### Persistent Connections
+
+The client uses Faraday's `:net_http_persistent` adapter for HTTP keep-alive by default. This is required for multi-worker transaction affinity — a persistent connection stays pinned to the Puma worker that accepted it, ensuring all requests within a `within_transaction` block hit the same process.
+
+- **Faraday 0.x:** The adapter is built-in. No extra dependencies needed.
+- **Faraday 2.x:** The adapter was extracted. Add to your Gemfile:
+
+  ```ruby
+  gem "faraday-net_http_persistent", "~> 2.1"
+  ```
+
+  And require it during app boot (e.g. in an initializer):
+
+  ```ruby
+  require "faraday/net_http_persistent"
+  ```
+
+To disable persistent connections:
+
+```ruby
+JsonapiToolbox::Client.configure do |config|
+  config.persistent_connections = false
+end
+```
+
 ---
 
 ## Transactions
