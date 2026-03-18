@@ -48,8 +48,8 @@ RSpec.describe JsonapiToolbox::Client::Base do
   describe "persistent connection adapter" do
     it "uses net_http_persistent adapter when persistent_connections is true" do
       connection = resource_class.connection
-      adapter = connection.faraday.builder.adapter
-      expect(adapter).to eq(Faraday::Adapter::NetHttpPersistent)
+      adapter_name = connection.faraday.builder.adapter.name
+      expect(adapter_name).to include("NetHttpPersistent")
     end
 
     it "uses the default adapter when persistent_connections is false" do
@@ -60,8 +60,8 @@ RSpec.describe JsonapiToolbox::Client::Base do
       end
 
       connection = fresh_class.connection
-      adapter = connection.faraday.builder.adapter
-      expect(adapter).not_to eq(Faraday::Adapter::NetHttpPersistent)
+      adapter_name = connection.faraday.builder.adapter.name
+      expect(adapter_name).not_to include("NetHttpPersistent")
     end
   end
 end

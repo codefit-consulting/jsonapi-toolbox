@@ -4,10 +4,10 @@ PATH
     jsonapi-toolbox (0.1.0)
       actionpack (>= 4.2)
       activesupport (>= 4.2)
-      faraday-net_http_persistent (~> 2.1)
       json_api_client (>= 1.22, < 2.0)
       jsonapi-parser (~> 0.1.1)
       jsonapi-serializer (~> 2.2)
+      net-http-persistent (>= 3.0)
 
 GEM
   remote: https://rubygems.org/
@@ -166,6 +166,7 @@ PLATFORMS
 
 DEPENDENCIES
   activerecord (>= 4.2)
+  faraday-net_http_persistent (~> 2.1)
   jsonapi-toolbox!
   rspec (~> 3.12)
   sqlite3

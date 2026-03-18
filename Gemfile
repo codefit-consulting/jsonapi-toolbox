@@ -8,4 +8,5 @@ group :development, :test do
   gem "rspec", "~> 3.12"
   gem "activerecord", ">= 4.2"
   gem "sqlite3"
+  gem "faraday-net_http_persistent", "~> 2.1"
 end
