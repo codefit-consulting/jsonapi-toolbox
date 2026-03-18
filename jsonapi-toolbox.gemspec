@@ -20,4 +20,5 @@ Gem::Specification.new do |spec|
   # Consuming apps should override this in their Gemfile to the jmchambers fork:
   #   gem "jsonapi-serializer", git: "https://github.com/jmchambers/jsonapi-serializer.git", branch: "master"
   spec.add_dependency "jsonapi-serializer", "~> 2.2"
+  spec.add_dependency "faraday-net_http_persistent", "~> 2.1"
 end

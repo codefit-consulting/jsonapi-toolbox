@@ -11,6 +11,13 @@ module JsonapiToolbox
           conn.use ServiceTokenMiddleware, token_provider: provider
         end
       end
+
+      def self._build_connection(rebuild = false)
+        if JsonapiToolbox::Client.configuration.persistent_connections
+          self.connection_options = connection_options.merge(adapter: :net_http_persistent)
+        end
+        super
+      end
     end
   end
 end
