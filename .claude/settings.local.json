@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(bundle install:*)",
-      "Bash(bundle exec rspec:*)",
-      "Bash(bundle exec ruby:*)"
-    ]
-  }
-}
