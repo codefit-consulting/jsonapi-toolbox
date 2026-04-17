@@ -201,7 +201,7 @@ V1::Hotel.find(42).destroy
 
 `configure_service_token` accepts a string or a callable (proc/lambda). The token is injected as an `X-Service-Token` header on every request via Faraday middleware.
 
-`with_headers` (from `json_api_client`) lets you set arbitrary headers for a block of calls — this is how the transaction system propagates `X-Transaction-ID`:
+`with_headers` (from `json_api_client`) lets you set arbitrary headers on a single resource class for a block of calls:
 
 ```ruby
 V1::Hotel.with_headers("X-Custom" => "value") do
@@ -209,9 +209,13 @@ V1::Hotel.with_headers("X-Custom" => "value") do
 end
 ```
 
+Note that `with_headers` is scoped to the class it's called on — `V1::Hotel.with_headers(...)` does **not** set headers on requests made by `V1::RoomType` inside the block. For cross-class header propagation (as the transaction system needs for `X-Transaction-ID`), use a Faraday middleware that reads from `Thread.current`; that's what `within_transaction` does internally.
+
 ### Persistent Connections
 
-The client uses Faraday's `:net_http_persistent` adapter for HTTP keep-alive by default. This is required for multi-worker transaction affinity — a persistent connection stays pinned to the Puma worker that accepted it, ensuring all requests within a `within_transaction` block hit the same process.
+The client uses Faraday's `:net_http_persistent` adapter for HTTP keep-alive by default. Keep-alive underpins **multi-worker transaction affinity**: when the receiving app runs under Puma/Unicorn/Passenger with multiple workers, a held transaction lives in memory on one specific worker process, and every request inside a `within_transaction` block must land on that same worker. A persistent TCP connection stays pinned to the worker that accepted it, so reusing one socket for the whole block is what makes this work.
+
+Affinity is scoped **per-transaction**, not per-resource-class. Inside a `within_transaction` block, `Transaction.within_transaction` builds one dedicated Faraday connection (own socket, own `Net::HTTP::Persistent` pool), stashes it on the current thread, and every `JsonapiToolbox::Client::Base` subclass used in the block routes through it. On block exit, the connection is closed and the thread-local is cleared. Outside the block, each subclass keeps its own connection, so normal traffic continues to load-balance across workers.
 
 - **Faraday 0.x:** The adapter is built-in. No extra dependencies needed.
 - **Faraday 2.x:** The adapter was extracted. Add to your Gemfile:
@@ -226,13 +230,15 @@ The client uses Faraday's `:net_http_persistent` adapter for HTTP keep-alive by 
   require "faraday/net_http_persistent"
   ```
 
-To disable persistent connections:
+To disable persistent connections (e.g. in test environments):
 
 ```ruby
 JsonapiToolbox::Client.configure do |config|
   config.persistent_connections = false
 end
 ```
+
+With persistent connections disabled, remote transactions will still work under a single-worker server, but will fail intermittently under multi-worker deployments.
 
 ---
 
@@ -338,20 +344,7 @@ class V1::Transaction < JsonapiToolbox::Client::Transaction
 end
 ```
 
-Use it directly:
-
-```ruby
-txn = V1::Transaction.create(timeout_seconds: 30)
-
-V1::Hotel.with_headers("X-Transaction-ID" => txn.id) do
-  V1::Hotel.create(name: "Test")
-  V1::RoomType.create(hotel_id: 1, name: "Suite")
-end
-
-txn.commit!   # PATCH /transactions/:id with state: "committed"
-```
-
-Or use the convenience wrapper that handles commit/rollback and header propagation:
+Then use `within_transaction` to wrap a block of remote work:
 
 ```ruby
 V1::Transaction.within_transaction(timeout_seconds: 30) do |txn|
@@ -360,6 +353,10 @@ V1::Transaction.within_transaction(timeout_seconds: 30) do |txn|
 end
 # commits on success, rolls back on any exception
 ```
+
+`within_transaction` handles commit/rollback, attaches `X-Transaction-ID` to every request in the block (via a Faraday middleware), and pins the block to a single worker by routing all requests through one dedicated connection (see [Persistent Connections](#persistent-connections)).
+
+**Use `within_transaction`.** The raw CRUD on `V1::Transaction` (`create`, `commit!`, `rollback!`) is available for inspection and scripting, but driving a transaction by hand is error-prone: you have to set `X-Transaction-ID` on every sibling request yourself, and you get no worker affinity, so in a multi-worker deployment the sibling requests can land on a worker that has never heard of the transaction.
 
 For full local+remote atomicity:
 

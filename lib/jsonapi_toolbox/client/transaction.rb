@@ -40,9 +40,14 @@ module JsonapiToolbox
       end
 
       # Convenience: create a transaction, then commit (or rollback on error).
+      #
       # While the block runs, every request from a JsonapiToolbox::Client::Base
-      # subclass on this thread carries the X-Transaction-ID header, courtesy
-      # of TransactionIdMiddleware on the shared connection stack.
+      # subclass on this thread is routed through a single Faraday connection
+      # (stashed in Thread.current). That pins the block's traffic to one TCP
+      # socket, which — under net_http_persistent keep-alive — keeps it on a
+      # single server worker, preserving the held-transaction state that
+      # lives in that worker's memory. TransactionIdMiddleware on the same
+      # connection attaches the X-Transaction-ID header.
       #
       #   V1::Transaction.within_transaction(timeout_seconds: 30) do
       #     V1::Hotel.create!(name: "Test")
@@ -56,19 +61,26 @@ module JsonapiToolbox
           return yield
         end
 
-        txn = create(timeout_seconds: timeout_seconds)
-        raise_on_create_errors!(txn)
-
+        dedicated_conn = build_dedicated_connection
         begin
+          Thread.current[Base::TRANSACTION_CONNECTION_KEY] = dedicated_conn
+
+          txn = create(timeout_seconds: timeout_seconds)
+          raise_on_create_errors!(txn)
+
           Thread.current[:jsonapi_toolbox_transaction_id] = txn.id
-          result = yield txn
-          txn.commit!
-          result
-        rescue StandardError
-          txn.rollback! rescue nil
-          raise
+          begin
+            result = yield txn
+            txn.commit!
+            result
+          rescue StandardError
+            txn.rollback! rescue nil
+            raise
+          end
         ensure
           Thread.current[:jsonapi_toolbox_transaction_id] = nil
+          Thread.current[Base::TRANSACTION_CONNECTION_KEY] = nil
+          close_dedicated_connection(dedicated_conn)
         end
       end
 
@@ -80,6 +92,17 @@ module JsonapiToolbox
         raise JsonapiToolbox::Transaction::Errors::TransactionError,
           errors.full_messages.join(", ")
       end
+
+      # Best-effort shutdown of the transaction-scoped connection's socket
+      # pool. Swallows errors so a bad close never masks the caller's real
+      # result (or exception).
+      def self.close_dedicated_connection(conn)
+        return unless conn
+        conn.faraday.close if conn.faraday.respond_to?(:close)
+      rescue StandardError
+        nil
+      end
+      private_class_method :close_dedicated_connection
 
       def self.raise_on_create_errors!(txn)
         return if txn.errors.blank?
