@@ -16,8 +16,22 @@ module JsonapiToolbox
         if JsonapiToolbox::Client.configuration.persistent_connections
           self.connection_options = connection_options.merge(adapter: :net_http_persistent)
         end
-        super
+        result = super
+        install_transaction_id_middleware!(result)
+        result
       end
+
+      # Ensures TransactionIdMiddleware is present on this class's Faraday
+      # stack exactly once. Called from _build_connection so every subclass
+      # gets the middleware on its own connection without requiring opt-in.
+      def self.install_transaction_id_middleware!(conn)
+        return unless conn
+        handlers = conn.faraday.builder.handlers
+        return if handlers.include?(TransactionIdMiddleware)
+
+        conn.use(TransactionIdMiddleware)
+      end
+      private_class_method :install_transaction_id_middleware!
     end
   end
 end

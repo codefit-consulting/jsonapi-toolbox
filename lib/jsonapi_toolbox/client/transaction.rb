@@ -39,8 +39,10 @@ module JsonapiToolbox
         state == "open"
       end
 
-      # Convenience: create a transaction, set X-Transaction-ID for all
-      # json_api_client calls in the block, then commit (or rollback on error).
+      # Convenience: create a transaction, then commit (or rollback on error).
+      # While the block runs, every request from a JsonapiToolbox::Client::Base
+      # subclass on this thread carries the X-Transaction-ID header, courtesy
+      # of TransactionIdMiddleware on the shared connection stack.
       #
       #   V1::Transaction.within_transaction(timeout_seconds: 30) do
       #     V1::Hotel.create!(name: "Test")
@@ -59,7 +61,7 @@ module JsonapiToolbox
 
         begin
           Thread.current[:jsonapi_toolbox_transaction_id] = txn.id
-          result = with_headers("X-Transaction-ID" => txn.id) { yield txn }
+          result = yield txn
           txn.commit!
           result
         rescue StandardError
