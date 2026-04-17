@@ -255,27 +255,30 @@ This is opt-in — it pulls in `json_api_client`, `singleton`, and expects `Acti
 ### How it works
 
 ```
-Calling App                             Receiving App
-                                        (held PG transaction on a dedicated thread)
+Calling App                                Receiving App
+                                           (held PG transaction on a dedicated thread)
 
-V1::Transaction.create(timeout: 30) ──> Manager creates HeldTransaction
-                                        Thread checks out AR connection, BEGIN
-<── transaction resource (state: open)
+V1::Transaction.within_transaction do
+  # <no remote call yet — nothing on the wire>
 
-with_headers("X-Transaction-ID: abc") {
-  V1::Hotel.create(name: "Test")   ──> TransactionAware detects header
-                                       Executes on held thread (SAVEPOINT)
-  <── hotel resource
+  V1::Hotel.create(name: "Test")    ─┬──> POST /transactions (materialise)
+                                     │    Manager creates HeldTransaction,
+                                     │    thread checks out AR connection, BEGIN
+                                     │ <── transaction (state: open)
+                                     │
+                                     └──> POST /hotels  (X-Transaction-ID: abc)
+                                          TransactionAware detects header,
+                                          executes on held thread (SAVEPOINT)
+                                     <──  hotel resource
 
-  V1::RoomType.create(hotel: 1)   ──> Same held transaction
-  <── room_type resource
-}
-
-txn.commit!                        ──> Manager.commit → COMMIT
-<── transaction resource (state: committed)
+  V1::RoomType.create(hotel: 1)       ──> POST /room_types (same held txn)
+                                     <──  room_type resource
+end                                   ──> PATCH /transactions/abc  state=committed
+                                          Manager.commit → COMMIT
+                                     <──  transaction (state: committed)
 ```
 
-If anything fails, the remote transaction rolls back (explicitly or via timeout). Wrap the calling side in `ActiveRecord::Base.transaction` for full local+remote atomicity.
+The `POST /transactions` only fires on the first resource call inside the block — see [Laziness](#client-side-calling-app) below. If the block makes no remote calls, nothing is sent. If anything fails, the remote transaction rolls back (explicitly or via timeout). Wrap the calling side in `ActiveRecord::Base.transaction` for full local+remote atomicity.
 
 ### Configuration
 
@@ -355,6 +358,12 @@ end
 ```
 
 `within_transaction` handles commit/rollback, attaches `X-Transaction-ID` to every request in the block (via a Faraday middleware), and pins the block to a single worker by routing all requests through one dedicated connection (see [Persistent Connections](#persistent-connections)).
+
+**Laziness.** `within_transaction` is lazy: no remote request is issued at block entry. The `POST /transactions` fires only on the first resource call inside the block. Blocks that make no remote calls — e.g. an interaction that wraps itself in `within_transaction` defensively but ends up with no remote-syncable data to push — cost nothing on the wire and don't consume a concurrency slot on the receiving app. Consequences:
+
+- The yielded `txn` is a `LazyTransaction` proxy. Before materialisation, `txn.id` is `nil`, `txn.state` is `"not_opened"`, and `txn.materialized?` is `false`. Once a remote call has fired, the proxy forwards to the real underlying transaction resource.
+- The `timeout_seconds` clock starts at the first remote call, not at block entry. Long local work at the start of a block no longer eats into the remote timeout budget.
+- Errors from `POST /transactions` (e.g. `ConcurrencyLimitError` on HTTP 429) now raise from the stack frame of your first remote call rather than from block entry. The error class is unchanged; `rescue` clauses around the block still catch it.
 
 **Use `within_transaction`.** The raw CRUD on `V1::Transaction` (`create`, `commit!`, `rollback!`) is available for inspection and scripting, but driving a transaction by hand is error-prone: you have to set `X-Transaction-ID` on every sibling request yourself, and you get no worker affinity, so in a multi-worker deployment the sibling requests can land on a worker that has never heard of the transaction.
 

@@ -136,7 +136,7 @@ RSpec.describe "within_transaction connection scoping" do
   describe "cleanup" do
     it "clears the thread-local after the block completes" do
       transaction_class.within_transaction { widget_class.create(name: "w") }
-      expect(Thread.current[JsonapiToolbox::Client::Base::TRANSACTION_CONNECTION_KEY]).to be_nil
+      expect(Thread.current[JsonapiToolbox::Client::Base::PENDING_TRANSACTION_KEY]).to be_nil
     end
 
     it "clears the thread-local when the block raises" do
@@ -150,7 +150,7 @@ RSpec.describe "within_transaction connection scoping" do
         transaction_class.within_transaction { raise "boom" }
       end.to raise_error("boom")
 
-      expect(Thread.current[JsonapiToolbox::Client::Base::TRANSACTION_CONNECTION_KEY]).to be_nil
+      expect(Thread.current[JsonapiToolbox::Client::Base::PENDING_TRANSACTION_KEY]).to be_nil
     end
 
     it "closes the dedicated connection on exit" do

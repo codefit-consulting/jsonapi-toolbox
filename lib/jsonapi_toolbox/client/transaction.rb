@@ -39,58 +39,70 @@ module JsonapiToolbox
         state == "open"
       end
 
-      # Convenience: create a transaction, then commit (or rollback on error).
+      # Create a transaction, run the block, commit (or rollback on error).
       #
-      # While the block runs, every request from a JsonapiToolbox::Client::Base
-      # subclass on this thread is routed through a single Faraday connection
-      # (stashed in Thread.current). That pins the block's traffic to one TCP
-      # socket, which — under net_http_persistent keep-alive — keeps it on a
-      # single server worker, preserving the held-transaction state that
-      # lives in that worker's memory. TransactionIdMiddleware on the same
-      # connection attaches the X-Transaction-ID header.
+      # Creation is **lazy**: no remote request is issued at block entry.
+      # Instead, a thread-local pending marker is set, and
+      # TransactionIdMiddleware materialises the transaction — POST
+      # /transactions on the same dedicated connection that will carry the
+      # rest of the block's traffic — on the first non-/transactions
+      # request inside the block. Blocks that make no remote requests
+      # cost nothing on the wire: no POST, no PATCH, no held-transaction
+      # slot consumed on the server.
       #
-      #   V1::Transaction.within_transaction(timeout_seconds: 30) do
+      #   V1::Transaction.within_transaction(timeout_seconds: 30) do |txn|
       #     V1::Hotel.create!(name: "Test")
       #     V1::RoomType.create!(hotel_id: 1, name: "Suite")
       #   end
       #
+      # The yielded `txn` is a LazyTransaction proxy. If the block makes
+      # no remote calls, `txn.state` reads "not_opened" and `txn.id` is
+      # nil. Otherwise it forwards to the underlying transaction resource.
       def self.within_transaction(timeout_seconds: nil)
-        # Re-entrant: if we're already inside a remote transaction on this
-        # thread, just yield into the existing one (no extra round trip).
-        if Thread.current[:jsonapi_toolbox_transaction_id]
-          return yield
+        # Reentrant: if an outer within_transaction on this thread has
+        # already set a pending marker (materialised or not), just yield
+        # into it. The outer owns creation, commit, and rollback.
+        if (existing = Thread.current[Base::PENDING_TRANSACTION_KEY])
+          return yield(LazyTransaction.new(existing))
         end
 
-        dedicated_conn = build_dedicated_connection
+        pending = {
+          transaction_class: self,
+          timeout_seconds: timeout_seconds,
+          connection: nil,
+          txn: nil
+        }
+        Thread.current[Base::PENDING_TRANSACTION_KEY] = pending
+
         begin
-          Thread.current[Base::TRANSACTION_CONNECTION_KEY] = dedicated_conn
-
-          txn = create(timeout_seconds: timeout_seconds)
-          raise_on_create_errors!(txn)
-
-          Thread.current[:jsonapi_toolbox_transaction_id] = txn.id
+          result = yield(LazyTransaction.new(pending))
+          pending[:txn]&.commit!
+          result
+        rescue StandardError
           begin
-            result = yield txn
-            txn.commit!
-            result
+            pending[:txn]&.rollback!
           rescue StandardError
-            txn.rollback! rescue nil
-            raise
+            # Best-effort rollback; don't mask the caller's real error.
           end
+          raise
         ensure
-          Thread.current[:jsonapi_toolbox_transaction_id] = nil
-          Thread.current[Base::TRANSACTION_CONNECTION_KEY] = nil
-          close_dedicated_connection(dedicated_conn)
+          Thread.current[Base::TRANSACTION_ID_KEY] = nil
+          Thread.current[Base::PENDING_TRANSACTION_KEY] = nil
+          close_dedicated_connection(pending[:connection])
         end
       end
 
-      private
-
-      def raise_if_errors!
-        return if errors.blank?
-
-        raise JsonapiToolbox::Transaction::Errors::TransactionError,
-          errors.full_messages.join(", ")
+      # Called from TransactionIdMiddleware on the first non-/transactions
+      # request inside a within_transaction block. Issues POST
+      # /transactions, stores the result on the pending marker, and sets
+      # the thread-local id so the middleware's header-attach picks it up
+      # for this request and every subsequent one.
+      def self.materialize_pending!(pending)
+        txn = create(timeout_seconds: pending[:timeout_seconds])
+        raise_on_create_errors!(txn)
+        pending[:txn] = txn
+        Thread.current[Base::TRANSACTION_ID_KEY] = txn.id
+        txn
       end
 
       # Best-effort shutdown of the transaction-scoped connection's socket
@@ -104,6 +116,15 @@ module JsonapiToolbox
       end
       private_class_method :close_dedicated_connection
 
+      private
+
+      def raise_if_errors!
+        return if errors.blank?
+
+        raise JsonapiToolbox::Transaction::Errors::TransactionError,
+          errors.full_messages.join(", ")
+      end
+
       def self.raise_on_create_errors!(txn)
         return if txn.errors.blank?
 
@@ -115,7 +136,6 @@ module JsonapiToolbox
 
         raise JsonapiToolbox::Transaction::Errors::TransactionError, message
       end
-
       private_class_method :raise_on_create_errors!
     end
   end

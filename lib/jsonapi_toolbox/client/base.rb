@@ -5,7 +5,17 @@ module JsonapiToolbox
     class Base < JsonApiClient::Resource
       self.json_key_format = :underscored_key
 
-      TRANSACTION_CONNECTION_KEY = :jsonapi_toolbox_transaction_connection
+      # Key for the thread-local pending-transaction marker set by
+      # Transaction.within_transaction. The value is a mutable hash that
+      # carries the Transaction subclass, requested timeout, the
+      # lazy-built dedicated connection, and the materialised txn (once
+      # the first non-/transactions request triggers its creation).
+      PENDING_TRANSACTION_KEY = :jsonapi_toolbox_pending_transaction
+
+      # Key for the thread-local transaction id, set once the pending
+      # transaction has been materialised. Read by TransactionIdMiddleware
+      # to attach X-Transaction-ID to outgoing requests.
+      TRANSACTION_ID_KEY = :jsonapi_toolbox_transaction_id
 
       def self.configure_service_token(token_or_proc)
         provider = token_or_proc.respond_to?(:call) ? token_or_proc : -> { token_or_proc }
@@ -24,14 +34,21 @@ module JsonapiToolbox
       end
 
       # Routes request-time lookups through a transaction-scoped connection
-      # when one is set on the current thread. json_api_client's Requestor
-      # calls klass.connection (no args, no block) on every request; by
-      # intercepting that path we pin every resource used inside a
-      # within_transaction block to a single Faraday connection (and thus
-      # a single TCP socket, and thus a single server worker).
+      # when a within_transaction block is active on the current thread.
+      # json_api_client's Requestor calls klass.connection (no args, no
+      # block) on every request; by intercepting that path we pin every
+      # resource used inside a block to a single Faraday connection (and
+      # thus a single TCP socket, and thus a single server worker).
+      #
+      # The dedicated connection is built lazily on first access — blocks
+      # that make no remote requests allocate nothing beyond the pending
+      # marker hash.
       def self.connection(rebuild = false, &block)
-        thread_conn = Thread.current[TRANSACTION_CONNECTION_KEY]
-        return thread_conn if thread_conn && !rebuild && !block_given?
+        pending = Thread.current[PENDING_TRANSACTION_KEY]
+        if pending && !rebuild && !block_given?
+          pending[:connection] ||= pending[:transaction_class].build_dedicated_connection
+          return pending[:connection]
+        end
 
         super
       end

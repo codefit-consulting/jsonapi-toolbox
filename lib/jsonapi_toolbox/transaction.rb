@@ -10,6 +10,8 @@ require "jsonapi_toolbox/transaction/serializer"
 require "jsonapi_toolbox/controller/transaction_aware"
 require "jsonapi_toolbox/controller/transactions_actions"
 require "jsonapi_toolbox/client/service_token_middleware"
+require "jsonapi_toolbox/client/transaction_id_middleware"
+require "jsonapi_toolbox/client/lazy_transaction"
 require "jsonapi_toolbox/client/base"
 require "jsonapi_toolbox/client/transaction"
 

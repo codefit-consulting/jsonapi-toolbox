@@ -13,6 +13,7 @@ end
 
 require "jsonapi_toolbox/client/service_token_middleware"
 require "jsonapi_toolbox/client/transaction_id_middleware"
+require "jsonapi_toolbox/client/lazy_transaction"
 require "jsonapi_toolbox/client/base"
 
 module JsonapiToolbox
