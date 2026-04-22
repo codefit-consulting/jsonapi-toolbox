@@ -88,13 +88,25 @@ module JsonapiToolbox
       # JsonApiClient::Connection onto another. The Handler wrappers are
       # immutable metadata (class + args + block), so sharing them across
       # builders is safe.
+      #
+      # Faraday stores the adapter in different places across major
+      # versions: on 0.x/1.x it lives inside `@handlers` (already copied
+      # by the `handlers.replace` above), and `builder.adapter` with no
+      # args is a mutator that raises ArgumentError. On 2.x `@adapter` is
+      # a separate slot and `builder.adapter` returns the current handler,
+      # so we have to re-attach it explicitly on the destination.
       def self.clone_middleware_stack(from:, to:)
         src_builder = from.faraday.builder
         dst_builder = to.faraday.builder
 
         dst_builder.handlers.replace(src_builder.handlers.dup)
 
-        src_adapter = src_builder.adapter
+        src_adapter =
+          begin
+            src_builder.adapter
+          rescue ArgumentError
+            nil
+          end
         return unless src_adapter
 
         args = src_adapter.instance_variable_get(:@args) || []
