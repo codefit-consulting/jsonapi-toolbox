@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require "active_support/notifications"
+
 module JsonapiToolbox
   module Client
     # JSON:API resource for managing held transactions on a remote app.
@@ -81,8 +83,12 @@ module JsonapiToolbox
         rescue StandardError
           begin
             pending[:txn]&.rollback!
-          rescue StandardError
-            # Best-effort rollback; don't mask the caller's real error.
+          rescue JsonApiClient::Errors::NotFound
+            # Slot is already gone server-side (reaped, foreign worker,
+            # already committed/rolled back). That's the outcome rollback
+            # was trying to achieve — treat as success.
+          rescue StandardError => rollback_error
+            report_rollback_failure(pending[:txn], rollback_error)
           end
           raise
         ensure
@@ -115,6 +121,32 @@ module JsonapiToolbox
         nil
       end
       private_class_method :close_dedicated_connection
+
+      # Surface rollback failures that aren't "slot already gone" — they
+      # indicate a server-side slot that will sit held until its timeout.
+      # Logs via the configured Transaction.logger and emits an
+      # `rollback_failed.jsonapi_toolbox` AS::Notifications event so apps
+      # can wire up alerting. Never re-raises: the caller's original
+      # exception is what matters and is about to be re-raised by the
+      # within_transaction rescue arm.
+      def self.report_rollback_failure(txn, error)
+        txn_id = txn&.id
+
+        JsonapiToolbox::Transaction.logger&.warn(
+          "[JsonapiToolbox::Transaction] within_transaction rollback failed " \
+          "for txn=#{txn_id || '(unknown)'}: #{error.class}: #{error.message}. " \
+          "Server-side slot will leak until timeout."
+        )
+
+        ActiveSupport::Notifications.instrument(
+          "rollback_failed.jsonapi_toolbox",
+          transaction_id: txn_id,
+          error: error
+        )
+      rescue StandardError
+        nil
+      end
+      private_class_method :report_rollback_failure
 
       private
 

@@ -295,6 +295,39 @@ JsonapiToolbox::Transaction.logger = Rails.logger
 
 Both apps' AR pool sizes should be increased by `max_concurrent` since each held transaction holds a connection for its lifetime.
 
+### Forking servers (Puma cluster, Unicorn, etc.)
+
+The transaction manager runs a background **reaper thread** that periodically rolls back expired transactions. In Ruby, threads do **not** survive `fork(2)` — only the calling thread is copied to each child. That has a sharp consequence for any forking app server that boots Rails in the parent process before forking workers.
+
+**Symptom of a missing reaper:** every `POST /transactions` eventually returns 429. Workers happily create transactions but nothing ever cleans up expired ones, so the held pool fills to `max_concurrent` and stays there until the process restarts. You will see no `Reaping expired transaction` log lines.
+
+**For Puma cluster mode with `preload_app!`** (the common production setup), call `start_reaper!` from `on_worker_boot`:
+
+```ruby
+# config/puma.rb
+preload_app!
+
+on_worker_boot do
+  # If you have AR:
+  ActiveRecord::Base.establish_connection if defined?(ActiveRecord::Base)
+
+  JsonapiToolbox::Transaction::Manager.instance.start_reaper!
+end
+```
+
+That's it. The gem self-heals on the next `create` if the reaper somehow isn't running, but installing it in `on_worker_boot` ensures the reaper is up from the moment the worker starts accepting requests rather than starting on the first transaction creation.
+
+**For Puma in single mode** (no cluster, no preload), or any non-forking server: start the reaper from a regular Rails initializer and you're done.
+
+```ruby
+# config/initializers/jsonapi_toolbox_transaction.rb
+JsonapiToolbox::Transaction::Manager.instance.start_reaper!
+```
+
+**Other forking servers (Unicorn, Pitchfork, Passenger).** Same idea: the reaper must be (re)started inside each worker after the fork. Use the after-fork hook for your server (`after_fork` in Unicorn, `PhusionPassenger.on_event(:starting_worker_process)` in Passenger, etc.) to call `start_reaper!`.
+
+**Diagnostic.** If you suspect a stuck pool in any environment, `GET /api/internal/transactions` returns the full held list. Any entry whose `expires_at` is in the past indicates a reaper that isn't running.
+
 ### Server side (receiving app)
 
 Three things to wire up:

@@ -108,4 +108,73 @@ RSpec.describe JsonapiToolbox::Transaction::Manager do
       expect(manager.active_count).to eq(2)
     end
   end
+
+  describe "reap-on-pressure inside #create" do
+    before do
+      JsonapiToolbox::Transaction.configure do |c|
+        c.max_concurrent = 1
+        c.reaper_interval = 100 # keep the background reaper out of the test
+      end
+    end
+
+    it "sweeps expired transactions when at capacity, allowing the new create to succeed" do
+      expired = manager.create(timeout_seconds: 10)
+      expired.instance_variable_set(:@expires_at, Time.now - 1)
+      expect(expired.expired?).to be true
+
+      new_txn = nil
+      expect { new_txn = manager.create(timeout_seconds: 10) }.not_to raise_error
+      expect(new_txn.id).not_to eq(expired.id)
+    end
+
+    it "still raises ConcurrencyLimitError when nothing is reapable" do
+      manager.create(timeout_seconds: 10)
+      expect {
+        manager.create(timeout_seconds: 10)
+      }.to raise_error(JsonapiToolbox::Transaction::Errors::ConcurrencyLimitError)
+    end
+  end
+
+  describe "reaper fork-awareness" do
+    it "restarts the reaper when the recorded PID doesn't match Process.pid" do
+      manager.create(timeout_seconds: 10)
+      original_thread = manager.instance_variable_get(:@reaper_thread)
+      expect(original_thread).to be_alive
+
+      # Simulate a fork: the recorded PID is the parent's, the thread is gone.
+      manager.instance_variable_set(:@reaper_pid, Process.pid + 999_999)
+      original_thread.kill
+      original_thread.join
+
+      manager.create(timeout_seconds: 10)
+
+      new_thread = manager.instance_variable_get(:@reaper_thread)
+      expect(new_thread).not_to equal(original_thread)
+      expect(new_thread).to be_alive
+      expect(manager.instance_variable_get(:@reaper_pid)).to eq(Process.pid)
+    end
+
+    it "restarts the reaper when the thread has died" do
+      manager.create(timeout_seconds: 10)
+      original_thread = manager.instance_variable_get(:@reaper_thread)
+      original_thread.kill
+      original_thread.join
+      expect(original_thread).not_to be_alive
+
+      manager.create(timeout_seconds: 10)
+
+      new_thread = manager.instance_variable_get(:@reaper_thread)
+      expect(new_thread).not_to equal(original_thread)
+      expect(new_thread).to be_alive
+    end
+
+    it "does not restart the reaper when it is already running in this process" do
+      manager.create(timeout_seconds: 10)
+      original_thread = manager.instance_variable_get(:@reaper_thread)
+
+      manager.create(timeout_seconds: 10)
+
+      expect(manager.instance_variable_get(:@reaper_thread)).to equal(original_thread)
+    end
+  end
 end
