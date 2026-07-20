@@ -53,7 +53,7 @@ RSpec.describe "within_transaction header propagation" do
       data: {
         type: "transactions",
         id: "txn-1",
-        attributes: { state: "open", timeout_seconds: 30 }
+        attributes: { state: "open", lease_ttl: 30 }
       }
     }.to_json
   end
@@ -63,7 +63,7 @@ RSpec.describe "within_transaction header propagation" do
       data: {
         type: "transactions",
         id: "txn-1",
-        attributes: { state: "committed", timeout_seconds: 30 }
+        attributes: { state: "committed", lease_ttl: 30 }
       }
     }.to_json
   end
@@ -145,7 +145,7 @@ RSpec.describe "within_transaction header propagation" do
           data: {
             type: "transactions",
             id: "txn-1",
-            attributes: { state: "rolled_back", timeout_seconds: 30 }
+            attributes: { state: "rolled_back", lease_ttl: 30 }
           }
         }.to_json
       )

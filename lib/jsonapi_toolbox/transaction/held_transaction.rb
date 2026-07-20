@@ -5,19 +5,35 @@ require "securerandom"
 module JsonapiToolbox
   module Transaction
     class HeldTransaction
-      attr_reader :id, :state, :timeout_seconds, :expires_at, :created_at
+      # lease_ttl: the granted lease (reap if idle this long). hard_cap_ttl: the
+      # absolute lifetime ceiling regardless of heartbeats (nil disables it).
+      attr_reader :id, :state, :lease_ttl, :hard_cap_ttl, :created_at, :op_count
 
       STATES = %w[open committed rolled_back].freeze
 
-      def initialize(timeout_seconds:)
+      def initialize(lease_ttl:, hard_cap_ttl: nil)
         @id = SecureRandom.uuid
-        @timeout_seconds = timeout_seconds
+        @lease_ttl = lease_ttl
+        @hard_cap_ttl = hard_cap_ttl
         @state = "open"
+        @op_count = 0
+
+        # Wall-clock stamp for display/serialization only.
         @created_at = Time.now
-        @expires_at = @created_at + timeout_seconds
+        # Monotonic stamps drive every reap decision, so an NTP step can't cause
+        # a false reap. last_seen advances on any heartbeat OR real op.
+        @created_mono = monotonic_now
+        @last_seen_mono = @created_mono
+
         @operation_queue = Queue.new
         @mutex = Mutex.new
         @thread = nil
+      end
+
+      # Display-only expiry: a rough "reap by if idle from now" wall-clock hint.
+      # Not used for reaping (that's monotonic + sliding on last_seen).
+      def expires_at
+        @created_at + @lease_ttl
       end
 
       def start!
@@ -55,8 +71,46 @@ module JsonapiToolbox
         @mutex.synchronize { @state == "open" }
       end
 
+      # Records liveness. Called on any inbound message carrying this txn's id —
+      # a heartbeat OR a real op. A real op also bumps op_count. Mutex-guarded so
+      # the reaper thread reads a consistent last_seen.
+      def touch!(counts_as_op: false)
+        @mutex.synchronize do
+          @last_seen_mono = monotonic_now
+          @op_count += 1 if counts_as_op
+        end
+      end
+
+      # Seconds since the last heartbeat/op (the reaper's liveness signal).
+      def idle_for
+        monotonic_now - @mutex.synchronize { @last_seen_mono }
+      end
+
+      # Seconds since creation (drives the hard_cap runaway check).
+      def age
+        monotonic_now - @created_mono
+      end
+
+      # The caller went silent for longer than its lease → presumed dead.
+      def lease_expired?
+        idle_for > @lease_ttl
+      end
+
+      # Alive and still heartbeating, but past the absolute sanity ceiling.
+      # nil hard_cap_ttl disables this branch entirely.
+      def hard_cap_ttl_exceeded?
+        !@hard_cap_ttl.nil? && age > @hard_cap_ttl
+      end
+
+      # nil when the txn should live; otherwise the reason to reap it.
+      def reap_reason
+        return :lease_expired if lease_expired?
+        return :hard_cap_ttl_exceeded if hard_cap_ttl_exceeded?
+        nil
+      end
+
       def expired?
-        open? && Time.now > @expires_at
+        open? && !reap_reason.nil?
       end
 
       def alive?
@@ -67,13 +121,19 @@ module JsonapiToolbox
         {
           id: @id,
           state: @state,
-          timeout_seconds: @timeout_seconds,
-          expires_at: @expires_at.utc.iso8601,
+          lease_ttl: @lease_ttl,
+          hard_cap_ttl: @hard_cap_ttl,
+          op_count: @op_count,
+          expires_at: expires_at.utc.iso8601,
           created_at: @created_at.utc.iso8601
         }
       end
 
       private
+
+      def monotonic_now
+        Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      end
 
       def transition_to!(new_state)
         @mutex.synchronize do

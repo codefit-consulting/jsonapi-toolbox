@@ -19,7 +19,7 @@ RSpec.describe JsonapiToolbox::Client::Transaction do
         "id" => "abc-123",
         "attributes" => {
           "state" => "open",
-          "timeout_seconds" => 30,
+          "lease_ttl" => 30,
           "expires_at" => "2026-02-20T10:30:30Z"
         }
       }
@@ -33,7 +33,7 @@ RSpec.describe JsonapiToolbox::Client::Transaction do
         "id" => "abc-123",
         "attributes" => {
           "state" => "committed",
-          "timeout_seconds" => 30,
+          "lease_ttl" => 30,
           "expires_at" => "2026-02-20T10:30:30Z"
         }
       }
@@ -47,7 +47,7 @@ RSpec.describe JsonapiToolbox::Client::Transaction do
         "id" => "abc-123",
         "attributes" => {
           "state" => "rolled_back",
-          "timeout_seconds" => 30,
+          "lease_ttl" => 30,
           "expires_at" => "2026-02-20T10:30:30Z"
         }
       }

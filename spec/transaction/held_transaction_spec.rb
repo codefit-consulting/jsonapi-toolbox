@@ -32,7 +32,7 @@ RSpec.describe JsonapiToolbox::Transaction::HeldTransaction do
     nil
   end
 
-  let(:txn) { described_class.new(timeout_seconds: 10) }
+  let(:txn) { described_class.new(lease_ttl: 10) }
 
   describe "#initialize" do
     it "generates a UUID id" do
@@ -111,7 +111,7 @@ RSpec.describe JsonapiToolbox::Transaction::HeldTransaction do
     end
 
     it "returns true when past expiry" do
-      expired_txn = described_class.new(timeout_seconds: 0)
+      expired_txn = described_class.new(lease_ttl: 0)
       sleep(0.01)
       expect(expired_txn.expired?).to be true
     end
@@ -122,7 +122,7 @@ RSpec.describe JsonapiToolbox::Transaction::HeldTransaction do
       json = txn.as_json
       expect(json[:id]).to eq(txn.id)
       expect(json[:state]).to eq("open")
-      expect(json[:timeout_seconds]).to eq(10)
+      expect(json[:lease_ttl]).to eq(10)
       expect(json[:expires_at]).to be_a(String)
       expect(json[:created_at]).to be_a(String)
     end

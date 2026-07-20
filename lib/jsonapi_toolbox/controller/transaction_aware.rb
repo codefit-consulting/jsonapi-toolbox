@@ -43,6 +43,15 @@ module JsonapiToolbox
         else
           yield
         end
+      rescue JsonapiToolbox::Transaction::Errors::ReapedError => e
+        # A reaped slot: render title (so the client's title-only harvester
+        # picks it up) + meta.transaction_reaped so the client raises a typed
+        # TransactionReaped instead of a misleading generic NotFound.
+        render_transaction_error(
+          "404", e.message,
+          status: :not_found, transaction_id: txn_id, reaped: true, reason: e.reason
+        )
+        nil
       rescue JsonapiToolbox::Transaction::Errors::NotFoundError
         render_transaction_error("404", "Transaction not found: #{txn_id}", status: :not_found)
         nil
@@ -60,14 +69,43 @@ module JsonapiToolbox
       def execute_on_held_transaction(txn_id, &block)
         manager = JsonapiToolbox::Transaction::Manager.instance
         txn = manager.find(txn_id)
-        txn.execute(&block)
+        # A real op is itself proof of life: refresh last_seen and count it.
+        txn.touch!(counts_as_op: true)
+
+        started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        begin
+          result = txn.execute(&block)
+        ensure
+          emit_operation_event(txn, txn_id, started)
+        end
+        result
       end
 
-      def render_transaction_error(status_code, detail, status:, transaction_id: nil, rolled_back: nil)
-        body = {
-          errors: [{ status: status_code, detail: detail }]
-        }
-        if transaction_id
+      def emit_operation_event(txn, txn_id, started)
+        duration = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+        ActiveSupport::Notifications.instrument(
+          "transaction_operation.jsonapi_toolbox",
+          transaction_id: txn_id,
+          endpoint: (request.path if respond_to?(:request)),
+          verb: (request.request_method if respond_to?(:request)),
+          in_txn: true,
+          op_count: txn.op_count,
+          duration: duration
+        )
+      rescue StandardError
+        nil
+      end
+
+      def render_transaction_error(status_code, detail, status:, transaction_id: nil, rolled_back: nil, reaped: false, reason: nil)
+        error = { status: status_code, title: detail, detail: detail }
+        body = { errors: [error] }
+        if reaped
+          body[:meta] = {
+            transaction_id: transaction_id,
+            transaction_reaped: true,
+            reason: reason
+          }
+        elsif transaction_id
           body[:meta] = {
             transaction_id: transaction_id,
             transaction_rolled_back: rolled_back

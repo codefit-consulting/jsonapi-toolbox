@@ -15,7 +15,7 @@ module JsonapiToolbox
     #   end
     #
     #   # Then use it like any other resource:
-    #   txn = V1::Transaction.create(timeout_seconds: 30)
+    #   txn = V1::Transaction.create(requested_lease_ttl: 30)
     #   txn.commit!
     #   txn.rollback!
     #   txn.state          # => "open" / "committed" / "rolled_back"
@@ -52,25 +52,39 @@ module JsonapiToolbox
       # cost nothing on the wire: no POST, no PATCH, no held-transaction
       # slot consumed on the server.
       #
-      #   V1::Transaction.within_transaction(timeout_seconds: 30) do |txn|
+      #   V1::Transaction.within_transaction do |txn|
       #     V1::Hotel.create!(name: "Test")
       #     V1::RoomType.create!(hotel_id: 1, name: "Suite")
       #   end
       #
+      # Optionally request a lease and/or a hard_cap_ttl for *this* transaction
+      # (each clamped by the receiver's policy). The common one is a tighter
+      # hard_cap_ttl than the receiver's generous default, sized to the work:
+      #
+      #   # this touches a handful of records — cap it at 2 min, not the ~1h default
+      #   V1::Transaction.within_transaction(requested_hard_cap_ttl: 120) do
+      #     V1::Hotel.create!(name: "Test")
+      #   end
+      #
+      # Per-transaction requests fall back to the configured
+      # `requested_lease_ttl` / `requested_hard_cap_ttl`, then the server default.
+      #
       # The yielded `txn` is a LazyTransaction proxy. If the block makes
       # no remote calls, `txn.state` reads "not_opened" and `txn.id` is
       # nil. Otherwise it forwards to the underlying transaction resource.
-      def self.within_transaction(timeout_seconds: nil)
+      def self.within_transaction(requested_lease_ttl: nil, requested_hard_cap_ttl: nil)
         # Reentrant: if an outer within_transaction on this thread has
         # already set a pending marker (materialised or not), just yield
-        # into it. The outer owns creation, commit, and rollback.
+        # into it. The outer owns creation, commit, and rollback (so any
+        # lease/hard_cap requested on an inner call is ignored — the outer's win).
         if (existing = Thread.current[Base::PENDING_TRANSACTION_KEY])
           return yield(LazyTransaction.new(existing))
         end
 
         pending = {
           transaction_class: self,
-          timeout_seconds: timeout_seconds,
+          requested_lease_ttl: requested_lease_ttl,
+          requested_hard_cap_ttl: requested_hard_cap_ttl,
           connection: nil,
           txn: nil
         }
@@ -92,6 +106,9 @@ module JsonapiToolbox
           end
           raise
         ensure
+          # Stop the heartbeat first so it can't fire against a slot we're
+          # tearing down, then clear markers and close the pinned connection.
+          stop_heartbeat!(pending)
           Thread.current[Base::TRANSACTION_ID_KEY] = nil
           Thread.current[Base::PENDING_TRANSACTION_KEY] = nil
           close_dedicated_connection(pending[:connection])
@@ -104,12 +121,92 @@ module JsonapiToolbox
       # the thread-local id so the middleware's header-attach picks it up
       # for this request and every subsequent one.
       def self.materialize_pending!(pending)
-        txn = create(timeout_seconds: pending[:timeout_seconds])
+        txn = create(create_attributes(pending))
         raise_on_create_errors!(txn)
         pending[:txn] = txn
         Thread.current[Base::TRANSACTION_ID_KEY] = txn.id
+        start_heartbeat!(pending)
         txn
       end
+
+      # Build the POST /transactions attributes: the lease/hard_cap_ttl this
+      # transaction requests. Per-transaction values (from within_transaction)
+      # win, then the app-configured defaults; anything still nil is omitted so
+      # the receiver applies its own default. All requests are clamped by the
+      # receiver's policy.
+      def self.create_attributes(pending)
+        config = JsonapiToolbox::Transaction.configuration
+
+        lease = pending[:requested_lease_ttl]
+        lease = config.requested_lease_ttl if lease.nil?
+
+        hard_cap_ttl = pending[:requested_hard_cap_ttl]
+        hard_cap_ttl = config.requested_hard_cap_ttl if hard_cap_ttl.nil?
+
+        attrs = {}
+        attrs[:requested_lease_ttl] = lease unless lease.nil?
+        attrs[:requested_hard_cap_ttl] = hard_cap_ttl unless hard_cap_ttl.nil?
+        attrs
+      end
+      private_class_method :create_attributes
+
+      # Start the automatic heartbeat: a background thread that POSTs
+      # /transactions/:id/heartbeat every granted_ttl/divisor seconds (floored
+      # at heartbeat_min_interval), proving the caller process is alive so the
+      # receiver reaps only a genuinely dead caller. Bound to the transaction
+      # lifecycle — no caller code touches it. Runs on the same worker-pinned
+      # connection (serialised with real requests by RequestSerializerMiddleware).
+      def self.start_heartbeat!(pending)
+        txn = pending[:txn]
+        conn = pending[:connection]
+        return unless txn && conn
+
+        config = JsonapiToolbox::Transaction.configuration
+        interval = heartbeat_interval(txn, config)
+        id = txn.id
+        path = "#{table_name}/#{id}/heartbeat"
+
+        thread = Thread.new do
+          loop do
+            sleep(interval)
+            begin
+              conn.run(:post, path, headers: { TransactionIdMiddleware::HEADER => id })
+            rescue JsonApiClient::Errors::NotFound
+              break # slot gone (reaped / committed) — stop pinging
+            rescue StandardError
+              # transient failure — keep trying; the reaper covers a dead caller
+            end
+          end
+        end
+        thread.abort_on_exception = false
+        thread.name = "jsonapi-toolbox-txn-heartbeat"
+        pending[:heartbeat_thread] = thread
+      end
+      private_class_method :start_heartbeat!
+
+      def self.stop_heartbeat!(pending)
+        thread = pending[:heartbeat_thread]
+        return unless thread
+        thread.kill
+        thread.join(1)
+      rescue StandardError
+        nil
+      ensure
+        pending[:heartbeat_thread] = nil
+      end
+      private_class_method :stop_heartbeat!
+
+      # Cadence = max(granted_ttl / divisor, min_interval), reading the granted
+      # lease the receiver echoed in the create response (falling back to the
+      # client's own configured default if the response omitted it).
+      def self.heartbeat_interval(txn, config)
+        attrs = txn.respond_to?(:attributes) ? txn.attributes : {}
+        granted = attrs[:lease_ttl] || attrs["lease_ttl"] || config.lease_ttl_default
+        divisor = config.heartbeat_divisor.to_f
+        divisor = 1.0 if divisor <= 0
+        [granted.to_f / divisor, config.heartbeat_min_interval.to_f].max
+      end
+      private_class_method :heartbeat_interval
 
       # Best-effort shutdown of the transaction-scoped connection's socket
       # pool. Swallows errors so a bad close never masks the caller's real

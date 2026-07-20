@@ -68,12 +68,12 @@ RSpec.describe "within_transaction connection scoping" do
 
   let(:txn_body) do
     { data: { type: "transactions", id: "txn-1",
-              attributes: { state: "open", timeout_seconds: 30 } } }.to_json
+              attributes: { state: "open", lease_ttl: 30 } } }.to_json
   end
 
   let(:committed_body) do
     { data: { type: "transactions", id: "txn-1",
-              attributes: { state: "committed", timeout_seconds: 30 } } }.to_json
+              attributes: { state: "committed", lease_ttl: 30 } } }.to_json
   end
 
   before do
@@ -144,7 +144,7 @@ RSpec.describe "within_transaction connection scoping" do
         stubs.patch("/api/transactions/txn-1") do
           json_response(
             { data: { type: "transactions", id: "txn-1",
-                      attributes: { state: "rolled_back", timeout_seconds: 30 } } }.to_json
+                      attributes: { state: "rolled_back", lease_ttl: 30 } } }.to_json
           )
         end
         transaction_class.within_transaction { raise "boom" }

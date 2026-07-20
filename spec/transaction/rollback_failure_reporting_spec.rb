@@ -78,7 +78,7 @@ RSpec.describe "within_transaction rollback failure reporting" do
 
   let(:txn_body) do
     { data: { type: "transactions", id: "txn-1",
-              attributes: { state: "open", timeout_seconds: 30 } } }.to_json
+              attributes: { state: "open", lease_ttl: 30 } } }.to_json
   end
 
   let(:widget_body) do
@@ -87,7 +87,7 @@ RSpec.describe "within_transaction rollback failure reporting" do
 
   def patch_success_body(state)
     { data: { type: "transactions", id: "txn-1",
-              attributes: { state: state, timeout_seconds: 30 } } }.to_json
+              attributes: { state: state, lease_ttl: 30 } } }.to_json
   end
 
   def json_headers

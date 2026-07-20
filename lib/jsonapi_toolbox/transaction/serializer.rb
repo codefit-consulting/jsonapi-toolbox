@@ -7,7 +7,9 @@ module JsonapiToolbox
 
       set_type :transactions
 
-      attributes :state, :timeout_seconds, :expires_at, :created_at
+      # lease_ttl + hard_cap_ttl are the negotiated grant the client reads back
+      # to set its heartbeat cadence (create-time negotiation).
+      attributes :state, :lease_ttl, :hard_cap_ttl, :expires_at, :created_at
     end
   end
 end

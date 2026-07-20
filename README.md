@@ -278,28 +278,105 @@ end                                   ──> PATCH /transactions/abc  state=com
                                      <──  transaction (state: committed)
 ```
 
-The `POST /transactions` only fires on the first resource call inside the block — see [Laziness](#client-side-calling-app) below. If the block makes no remote calls, nothing is sent. If anything fails, the remote transaction rolls back (explicitly or via timeout). Wrap the calling side in `ActiveRecord::Base.transaction` for full local+remote atomicity.
+The `POST /transactions` only fires on the first resource call inside the block — see [Laziness](#client-side-calling-app) below. If the block makes no remote calls, nothing is sent. If anything fails, the remote transaction rolls back (explicitly, or by being reaped once the caller stops heartbeating). Wrap the calling side in `ActiveRecord::Base.transaction` for full local+remote atomicity.
+
+While the block is open, the client runs an **automatic heartbeat** (a background thread bound to the transaction lifecycle — you never touch it) that pings the receiver so it knows the caller is still alive. The receiver reaps a held transaction **only** when the caller stops heartbeating (crash / OOM-kill / network partition) or blows an optional runaway `hard_cap_ttl` — not on a blind wall-clock deadline. See [Timeout model](#timeout-model-crash-only-lease--heartbeat).
 
 ### Configuration
 
+Everything is defaulted — an app only sets what it wants to override. The gem
+**never reads ENV itself**; if you want env-driven values, read them in your own
+initializer and assign them here (ENV or literals — your choice).
+
 ```ruby
 JsonapiToolbox::Transaction.configure do |config|
-  config.max_concurrent = 10      # max held transactions per process
-  config.default_timeout = 30     # seconds
-  config.max_timeout = 60         # server-side cap
-  config.reaper_interval = 5      # seconds between reaper sweeps
+  # Shared
+  config.max_concurrent         = 10    # max held transactions per process
+
+  # Receiver policy — authoritative when this app *hosts* a transaction
+  config.lease_ttl_default      = 30    # lease granted when the client requests none
+  config.lease_ttl_min          = 10    # clamp floor for a client-requested lease
+  config.lease_ttl_max          = 120   # clamp ceiling for a client-requested lease
+  config.hard_cap_ttl_default   = 3600  # absolute max lifetime (s from creation); nil disables entirely
+  config.hard_cap_ttl_max       = 3600  # clamp ceiling for a requested hard_cap_ttl; nil = no ceiling
+  config.reaper_scan_interval   = 5     # seconds between reaper sweeps
+
+  # Client policy — used when this app *initiates* a transaction
+  config.heartbeat_divisor      = 3     # heartbeats per lease window (tolerate divisor-1 misses)
+  config.heartbeat_min_interval = 2     # floor, so a small lease can't cause a heartbeat storm
+  config.requested_lease_ttl    = nil   # default lease to request; also per-txn (nil → server default)
+  config.requested_hard_cap_ttl = nil   # default hard_cap_ttl to request; also per-txn (nil → server default)
 end
 
 JsonapiToolbox::Transaction.logger = Rails.logger
 ```
 
-Both apps' AR pool sizes should be increased by `max_concurrent` since each held transaction holds a connection for its lifetime.
+**Most apps set none of the timing values.** Everything that governs *how long a
+transaction stays open and when it's reaped* — the lease, heartbeat, hard-cap,
+and reaper timings — has defaults tuned for the common case and rarely needs
+fine-tuning. There's no budget to size and no timeout to guess: a live caller is
+proven alive by its automatic heartbeat, and a dead one is reaped a few seconds
+after it stops, so the model is self-correcting. Reach for these only to
+*tighten* (e.g. a shorter `lease_ttl_default` for faster crash detection), and
+even then rarely.
+
+**The two you scale to your app** are capacity settings, not timings — size them
+to what your app does and how many DB connections it can support:
+
+- **`max_concurrent`** — how many held transactions a process supports at once.
+  Each holds an AR connection for its lifetime, so raise it (and your app's AR
+  pool by the same amount) for a busy receiver. Bounded by the DB connections you
+  can afford, not by any time budget.
+- **`hard_cap_ttl_max`** — the longest lifetime a caller is *allowed* to request.
+  Default 1 h is generous; lower it to be stricter, or raise/nil it only if you
+  genuinely have a long operation that needs to ask for more.
+
+**You do not need matching constants across the two apps — they negotiate.** On
+`POST /transactions` the client sends its `requested_lease_ttl` /
+`requested_hard_cap_ttl` (or nothing); the receiver clamps them to its own
+policy, stores the granted values, and **echoes them in the create response**.
+The client reads the granted `lease_ttl` back and sets its heartbeat cadence to
+`max(granted_ttl / heartbeat_divisor, heartbeat_min_interval)`. Whichever app is
+the *receiver* for a given call is the sole authority on reaping, so a
+v1↔v2 mismatch is impossible.
+
+**About `hard_cap_ttl`.** It is the **only** hard cutoff, and it's a runaway
+sanity check, not a routine deadline: default ~1 h, **settable to `nil` to
+disable entirely**. Your app should never need — or ask — to hold a single
+remote transaction open anywhere near this long; if it trips, something is
+genuinely wrong (a runaway that keeps heartbeating), not merely slow. A caller
+can request a tighter per-transaction `hard_cap_ttl` — sized to the work — via
+`requested_hard_cap_ttl` (in `configure` for an app-wide default, or per call on
+`within_transaction`), clamped only by the receiver's `hard_cap_ttl_max`.
+
+**Static vs. per-transaction.** Only two values can be set **per transaction**,
+by passing them to `within_transaction`: `requested_lease_ttl` and
+`requested_hard_cap_ttl` (each falls back to its configured default, then the
+server's). Everything else is **process-wide static config** set in `configure`.
+
+```ruby
+# per-transaction override: request a tighter runaway cap than the receiver's default
+V1::Transaction.within_transaction(requested_hard_cap_ttl: 120) do
+  V1::Hotel.create(name: "Test")
+end
+```
+
+The split is deliberate: the receiver-policy values (`max_concurrent`, the
+`lease_ttl_*` clamps, `hard_cap_ttl_*`, `reaper_scan_interval`) are the
+*receiver's* authority — one caller can't dynamically change how another process
+reaps or how many slots it has; it can only *request* a lease / hard-cap and take
+whatever the receiver clamps it to. The heartbeat cadence (`heartbeat_divisor`,
+`heartbeat_min_interval`) is client-wide behaviour, not varied per call (it's
+derived from the granted lease anyway).
+
+> **Deployment note:** raise each app's AR pool size by `max_concurrent`, since
+> each held transaction holds a connection for its lifetime.
 
 ### Forking servers (Puma cluster, Unicorn, etc.)
 
-The transaction manager runs a background **reaper thread** that periodically rolls back expired transactions. In Ruby, threads do **not** survive `fork(2)` — only the calling thread is copied to each child. That has a sharp consequence for any forking app server that boots Rails in the parent process before forking workers.
+The transaction manager runs a background **reaper thread** that periodically rolls back transactions whose caller has gone silent (missed heartbeats past its lease) or blown the `hard_cap_ttl`. In Ruby, threads do **not** survive `fork(2)` — only the calling thread is copied to each child. That has a sharp consequence for any forking app server that boots Rails in the parent process before forking workers.
 
-**Symptom of a missing reaper:** every `POST /transactions` eventually returns 429. Workers happily create transactions but nothing ever cleans up expired ones, so the held pool fills to `max_concurrent` and stays there until the process restarts. You will see no `Reaping expired transaction` log lines.
+**Symptom of a missing reaper:** every `POST /transactions` eventually returns 429. Workers happily create transactions but nothing ever cleans up reapable ones, so the held pool fills to `max_concurrent` and stays there until the process restarts. You will see no `Reaping transaction` log lines.
 
 **For Puma cluster mode with `preload_app!`** (the common production setup), call `start_reaper!` from `on_worker_boot`:
 
@@ -326,7 +403,7 @@ JsonapiToolbox::Transaction::Manager.instance.start_reaper!
 
 **Other forking servers (Unicorn, Pitchfork, Passenger).** Same idea: the reaper must be (re)started inside each worker after the fork. Use the after-fork hook for your server (`after_fork` in Unicorn, `PhusionPassenger.on_event(:starting_worker_process)` in Passenger, etc.) to call `start_reaper!`.
 
-**Diagnostic.** If you suspect a stuck pool in any environment, `GET /api/internal/transactions` returns the full held list. Any entry whose `expires_at` is in the past indicates a reaper that isn't running.
+**Diagnostic.** If you suspect a stuck pool in any environment, `GET /api/internal/transactions` returns the full held list. A pool sitting at `max_concurrent` with old `created_at` timestamps and no `Reaping transaction` log lines indicates a reaper that isn't running. (`expires_at` in the list is a rough display hint only — actual reaping is driven by heartbeat freshness, not that field.)
 
 ### Server side (receiving app)
 
@@ -343,11 +420,12 @@ class Api::Internal::TransactionsController < Api::Internal::BaseController
   include JsonapiToolbox::Controller::TransactionsActions
 end
 
-# 3. Route
+# 3. Routes — note the extra heartbeat route
 resources :transactions, only: [:index, :show, :create, :update]
+post "transactions/:id/heartbeat", to: "transactions#heartbeat"
 ```
 
-`TransactionsActions` provides all four actions and the serializer. `TransactionAware` provides `with_transaction_context` for your other controllers:
+`TransactionsActions` provides all the actions (including `heartbeat`) and the serializer. The heartbeat route is required for the crash-only timeout model — the client's automatic heartbeat POSTs to it to prove liveness; without it, held transactions would be reaped as soon as the lease elapsed. `TransactionAware` provides `with_transaction_context` for your other controllers:
 
 ```ruby
 class Api::Internal::HotelsController < Api::Internal::BaseController
@@ -367,7 +445,7 @@ class Api::Internal::HotelsController < Api::Internal::BaseController
 end
 ```
 
-When `X-Transaction-ID` is present, the block executes on the held transaction's thread inside a SAVEPOINT. When absent, it executes normally. If an operation fails, the SAVEPOINT rolls back but the outer transaction stays alive — the caller can continue or rollback.
+When `X-Transaction-ID` is present, the block executes on the held transaction's thread inside a SAVEPOINT, and the op itself refreshes the transaction's liveness (a real op counts as a heartbeat). When absent, it executes normally. If an operation fails, the SAVEPOINT rolls back but the outer transaction stays alive — the caller can continue or rollback. If the referenced transaction was already reaped, `with_transaction_context` renders a legible reaped error (404 with `meta.transaction_reaped`) that the client turns into a typed `TransactionReaped` — see [Errors](#errors).
 
 ### Client side (calling app)
 
@@ -383,19 +461,28 @@ end
 Then use `within_transaction` to wrap a block of remote work:
 
 ```ruby
-V1::Transaction.within_transaction(timeout_seconds: 30) do |txn|
+V1::Transaction.within_transaction do |txn|
   V1::Hotel.create(name: "Test")
   V1::RoomType.create(hotel_id: 1, name: "Suite")
 end
 # commits on success, rolls back on any exception
 ```
 
-`within_transaction` handles commit/rollback, attaches `X-Transaction-ID` to every request in the block (via a Faraday middleware), and pins the block to a single worker by routing all requests through one dedicated connection (see [Persistent Connections](#persistent-connections)).
+`within_transaction` handles commit/rollback, attaches `X-Transaction-ID` to every request in the block (via a Faraday middleware), pins the block to a single worker by routing all requests through one dedicated connection (see [Persistent Connections](#persistent-connections)), and runs the **automatic heartbeat** for the block's lifetime so the receiver keeps the transaction alive as long as this process is. You never manage the heartbeat thread; it starts at materialisation and is torn down on commit/rollback. Its requests are serialised with your real requests on the pinned connection, so they never race on the socket.
+
+To request a lease and/or `hard_cap_ttl` for a transaction, pass `requested_lease_ttl:` / `requested_hard_cap_ttl:` to `within_transaction` (or set app-wide defaults in `configure`, § [Configuration](#configuration)). Both are clamped by the receiver, which echoes the grant; the heartbeat cadence follows automatically. The most common use is a tighter hard cap than the receiver's generous default, sized to the work:
+
+```ruby
+# this op only touches a handful of records — cap it at 2 min, not the receiver's ~1 h default
+V1::Transaction.within_transaction(requested_hard_cap_ttl: 120) do
+  V1::Hotel.create(name: "Test")
+end
+```
 
 **Laziness.** `within_transaction` is lazy: no remote request is issued at block entry. The `POST /transactions` fires only on the first resource call inside the block. Blocks that make no remote calls — e.g. an interaction that wraps itself in `within_transaction` defensively but ends up with no remote-syncable data to push — cost nothing on the wire and don't consume a concurrency slot on the receiving app. Consequences:
 
 - The yielded `txn` is a `LazyTransaction` proxy. Before materialisation, `txn.id` is `nil`, `txn.state` is `"not_opened"`, and `txn.materialized?` is `false`. Once a remote call has fired, the proxy forwards to the real underlying transaction resource.
-- The `timeout_seconds` clock starts at the first remote call, not at block entry. Long local work at the start of a block no longer eats into the remote timeout budget.
+- The lease + heartbeat start at the first remote call (materialisation), not at block entry. Long local work at the start of a block costs nothing remotely.
 - Errors from `POST /transactions` (e.g. `ConcurrencyLimitError` on HTTP 429) now raise from the stack frame of your first remote call rather than from block entry. The error class is unchanged; `rescue` clauses around the block still catch it.
 
 **Use `within_transaction`.** The raw CRUD on `V1::Transaction` (`create`, `commit!`, `rollback!`) is available for inspection and scripting, but driving a transaction by hand is error-prone: you have to set `X-Transaction-ID` on every sibling request yourself, and you get no worker affinity, so in a multi-worker deployment the sibling requests can land on a worker that has never heard of the transaction.
@@ -404,7 +491,7 @@ For full local+remote atomicity:
 
 ```ruby
 ActiveRecord::Base.transaction do
-  V1::Transaction.within_transaction(timeout_seconds: 30) do
+  V1::Transaction.within_transaction do
     # Remote work (inside V1's held PG transaction)
     V1::Hotel.create(name: "Test")
 
@@ -416,38 +503,103 @@ end
 # We commit here
 ```
 
+### Timeout model: crash-only lease + heartbeat
+
+The receiver reaps a held transaction only when the caller is demonstrably gone,
+not on a blind wall-clock deadline. Two independent reap reasons, surfaced
+distinctly (via the typed error and the `transaction_reaped` event):
+
+- **`lease_expired`** — the caller stopped heartbeating for longer than its
+  granted `lease_ttl` (crash / OOM-kill / network partition). The normal reap.
+  A real op or a heartbeat refreshes the lease, so a fan-out of hundreds of
+  serial writes — or a long *quiet* local computation between two remote calls —
+  is never reaped while the caller lives.
+- **`hard_cap_ttl_exceeded`** — the caller is alive and still heartbeating but
+  has blown the absolute `hard_cap_ttl` ceiling. A runaway. `hard_cap_ttl` is nil-able.
+
+Worst-case reap latency is `lease_ttl + reaper_scan_interval`. The receiver uses
+a **monotonic** clock, so an NTP step can't cause a false reap.
+
 ### Safety
 
-- **Timeout**: Each transaction expires after `timeout_seconds` (capped by `max_timeout`). The reaper thread automatically rolls back expired transactions.
+- **Crash-only reaping**: see [Timeout model](#timeout-model-crash-only-lease--heartbeat) above.
 - **Concurrency limit**: Returns HTTP 429 when `max_concurrent` is reached. Prevents AR connection pool starvation.
-- **Process crash**: PG drops the connection, PG auto-rolls back. No orphaned state.
-- **Monitoring**: `GET /transactions` lists active held transactions. The manager logs all lifecycle events.
+- **Process crash**: PG drops the connection, PG auto-rolls back. No orphaned state. The reaper then evicts the dead slot once its lease lapses.
+- **Monitoring**: `GET /transactions` lists active held transactions; the manager logs all lifecycle events and emits instrumentation ([Observability](#observability)).
 
 ### API contract
 
-All transaction lifecycle operations use standard JSON:API CRUD:
+All transaction lifecycle operations use standard JSON:API CRUD, plus the heartbeat endpoint:
 
 | Action | Method | Path | Body |
 |--------|--------|------|------|
-| Create | POST | `/transactions` | `{data: {type: "transactions", attributes: {timeout_seconds: 30}}}` |
+| Create | POST | `/transactions` | `{data: {type: "transactions", attributes: {requested_lease_ttl: 30, requested_hard_cap_ttl: 300}}}` |
 | Show | GET | `/transactions/:id` | |
 | List | GET | `/transactions` | |
+| Heartbeat | POST | `/transactions/:id/heartbeat` | *(empty; 204 No Content on success)* |
 | Commit | PATCH | `/transactions/:id` | `{data: {type: "transactions", id: "...", attributes: {state: "committed"}}}` |
 | Rollback | PATCH | `/transactions/:id` | `{data: {type: "transactions", id: "...", attributes: {state: "rolled_back"}}}` |
 
-Error responses within a held transaction include metadata:
+Create attributes are both optional: `requested_lease_ttl` and `requested_hard_cap_ttl`. Each is clamped by the receiver's policy. The create response **echoes the granted values** so the client can set its heartbeat cadence:
 
 ```json
 {
-  "errors": [{"status": "422", "detail": "Name can't be blank"}],
-  "meta": {
-    "transaction_id": "abc-123",
-    "transaction_rolled_back": false
+  "data": {
+    "type": "transactions",
+    "id": "abc-123",
+    "attributes": {
+      "state": "open",
+      "lease_ttl": 30,
+      "hard_cap_ttl": 300
+    }
   }
 }
 ```
 
-`transaction_rolled_back: false` means the SAVEPOINT rolled back but the transaction is still alive. `true` means the whole transaction is gone (e.g., expired).
+**Operation error** responses within a held transaction include metadata:
+
+```json
+{
+  "errors": [{"status": "422", "title": "Name can't be blank", "detail": "Name can't be blank"}],
+  "meta": { "transaction_id": "abc-123", "transaction_rolled_back": false }
+}
+```
+
+`transaction_rolled_back: false` means the SAVEPOINT rolled back but the transaction is still alive. `true` means the whole transaction is gone.
+
+**Reaped** responses (a request/heartbeat referencing an already-reaped slot) carry a `title` and a distinct `transaction_reaped` meta, so the client raises a typed `TransactionReaped` rather than a misleading generic 404:
+
+```json
+{
+  "errors": [{"status": "404", "title": "Transaction abc-123 was reaped ...", "detail": "..."}],
+  "meta": { "transaction_id": "abc-123", "transaction_reaped": true, "reason": "lease_expired" }
+}
+```
+
+`reason` is `"lease_expired"` or `"hard_cap_ttl_exceeded"`.
+
+### Observability
+
+The gem emits plain [`ActiveSupport::Notifications`](https://api.rubyonrails.org/classes/ActiveSupport/Notifications.html) events (no metrics-library dependency — works on Rails 4.2), so each app can subscribe and export with whatever collector it can load. All events are namespaced `*.jsonapi_toolbox`:
+
+| Event | Payload | Fires |
+|-------|---------|-------|
+| `transaction_materialized.jsonapi_toolbox` | `id, lease_ttl, hard_cap_ttl` | receiver grants a new held transaction |
+| `transaction_committed.jsonapi_toolbox` | `id, op_count, duration` | commit |
+| `transaction_rolled_back.jsonapi_toolbox` | `id, op_count, duration` | explicit rollback |
+| `transaction_reaped.jsonapi_toolbox` | `id, reason, idle_for, age, op_count` | reaper tears a slot down |
+| `transaction_operation.jsonapi_toolbox` | `transaction_id, endpoint, verb, in_txn, op_count, duration` | each op run on a held transaction |
+| `rollback_failed.jsonapi_toolbox` | `transaction_id, error` | a client-side `within_transaction` rollback failed |
+
+```ruby
+# e.g. in an initializer — subscribe and forward to your metrics stack
+ActiveSupport::Notifications.subscribe("transaction_reaped.jsonapi_toolbox") do |*args|
+  event = ActiveSupport::Notifications::Event.new(*args)
+  StatsD.increment("v1_sync.transaction_reaped", tags: ["reason:#{event.payload[:reason]}"])
+end
+```
+
+The `transaction_reaped` event is the one unambiguous "caller died / budget blown" signal — a good thing to alert on.
 
 ---
 
@@ -466,11 +618,29 @@ All errors are under `JsonapiToolbox::Errors` and rendered automatically by `ren
 | `SerializerNotFoundError` | 500 | Auto-detection couldn't find a serializer for the controller |
 | `ActiveRecord::RecordNotFound` | 404 | Standard AR not-found (detail strips internal namespaces) |
 
-Transaction-specific errors are under `JsonapiToolbox::Transaction::Errors`:
+Transaction-specific errors are under `JsonapiToolbox::Transaction::Errors` (raised on the **receiver**):
 
 | Error | HTTP | When |
 |-------|------|------|
-| `NotFoundError` | 404 | Transaction ID not found |
-| `ExpiredError` | 410 | Transaction timed out |
+| `NotFoundError` | 404 | Transaction ID never existed on this process |
+| `ReapedError` | 404 | Transaction was reaped (caller went silent, or blew `hard_cap_ttl`); carries `reason` and renders `meta.transaction_reaped` |
+| `ExpiredError` | 410 | Transaction is no longer open (already committed/rolled back) |
 | `ConcurrencyLimitError` | 429 | `max_concurrent` held transactions reached |
 | `OperationError` | 422/500 | A block executed within a held transaction raised |
+
+On the **client**, a reaped-slot response is turned into a typed error you can rescue:
+
+| Error | Base | Carries | When |
+|-------|------|---------|------|
+| `JsonapiToolbox::Client::TransactionReaped` | `JsonApiClient::Errors::NotFound` | `transaction_id`, `reason` | any request/heartbeat came back with `meta.transaction_reaped` |
+
+Because `TransactionReaped` subclasses `NotFound`, existing `rescue JsonApiClient::Errors::NotFound` paths still catch it; rescue `TransactionReaped` specifically when you want the self-describing message (it names the transaction and reason instead of string-scraping the resource URL).
+
+```ruby
+begin
+  V1::Transaction.within_transaction { V1::Hotel.create(name: "x") }
+rescue JsonapiToolbox::Client::TransactionReaped => e
+  logger.warn("remote txn #{e.transaction_id} reaped (#{e.reason}); nothing was saved")
+  # nothing committed — safe to retry or surface a clear message
+end
+```

@@ -30,6 +30,7 @@ module JsonapiToolbox
         end
         result = super
         install_transaction_id_middleware!(result)
+        install_transaction_reaped_middleware!(result)
         result
       end
 
@@ -69,6 +70,7 @@ module JsonapiToolbox
 
         dedicated = connection_class.new(options.merge(site: site))
         clone_middleware_stack(from: source, to: dedicated)
+        install_request_serializer_middleware!(dedicated)
         dedicated
       end
 
@@ -83,6 +85,30 @@ module JsonapiToolbox
         conn.use(TransactionIdMiddleware)
       end
       private_class_method :install_transaction_id_middleware!
+
+      # Ensures TransactionReapedMiddleware is present exactly once, so any
+      # response carrying meta.transaction_reaped raises the typed
+      # TransactionReaped instead of a generic NotFound.
+      def self.install_transaction_reaped_middleware!(conn)
+        return unless conn
+        handlers = conn.faraday.builder.handlers
+        return if handlers.include?(TransactionReapedMiddleware)
+
+        conn.use(TransactionReapedMiddleware)
+      end
+      private_class_method :install_transaction_reaped_middleware!
+
+      # Serialises all requests on the dedicated (worker-pinned) connection so
+      # the automatic heartbeat thread can never overlap a real request on the
+      # shared socket. Added once, with a fresh per-connection mutex.
+      def self.install_request_serializer_middleware!(conn)
+        return unless conn
+        handlers = conn.faraday.builder.handlers
+        return if handlers.include?(RequestSerializerMiddleware)
+
+        conn.use(RequestSerializerMiddleware, mutex: Mutex.new)
+      end
+      private_class_method :install_request_serializer_middleware!
 
       # Copies the Faraday middleware stack AND adapter from one
       # JsonApiClient::Connection onto another. The Handler wrappers are
