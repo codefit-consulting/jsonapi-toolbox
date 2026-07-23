@@ -280,7 +280,7 @@ end                                   ──> PATCH /transactions/abc  state=com
 
 The `POST /transactions` only fires on the first resource call inside the block — see [Laziness](#client-side-calling-app) below. If the block makes no remote calls, nothing is sent. If anything fails, the remote transaction rolls back (explicitly, or by being reaped once the caller stops heartbeating). Wrap the calling side in `ActiveRecord::Base.transaction` for full local+remote atomicity.
 
-While the block is open, the client runs an **automatic heartbeat** (a background thread bound to the transaction lifecycle — you never touch it) that pings the receiver so it knows the caller is still alive. The receiver reaps a held transaction **only** when the caller stops heartbeating (crash / OOM-kill / network partition) or blows an optional runaway `hard_cap_ttl` — not on a blind wall-clock deadline. See [Timeout model](#timeout-model-crash-only-lease--heartbeat).
+While the block is open, the client runs an **automatic heartbeat** (a background thread bound to the transaction lifecycle — you never touch it) that pings the receiver so it knows the caller is still alive. The receiver reaps a held transaction **only** when the caller stops heartbeating (crash / OOM-kill / network partition) or blows an optional runaway `hard_cap_ttl` — not on a blind wall-clock deadline. An **operation in flight also counts as liveness**: a single op that runs longer than the lease won't be reaped while it's executing (its heartbeat is serialised behind it on the pinned connection anyway), only if it blows the `hard_cap_ttl`. See [Timeout model](#timeout-model-crash-only-lease--heartbeat).
 
 ### Configuration
 

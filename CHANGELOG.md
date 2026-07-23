@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.3.1
+
+### Fixed
+
+- **Don't reap a held transaction while it's actively executing an operation.**
+  A single remote op that ran longer than `lease_ttl` could have its own
+  transaction reaped mid-flight — even though the caller was alive and blocked
+  waiting on it. The client heartbeat can't compensate: it's serialised behind
+  the in-flight op on the pinned connection, so it can't send until the op
+  returns. `HeldTransaction` now tracks a mutex-guarded `busy?` flag set while
+  the held thread is inside a caller's operation block, and `lease_expired?`
+  no longer fires while busy — an in-flight op is itself proof of liveness.
+  The `hard_cap_ttl` backstop stays unconditional, so a genuinely stuck op is
+  still caught. Op completion also refreshes `last_seen`, so a long op doesn't
+  leave the transaction instantly reapable the moment it finishes.
+
 ## 0.3.0
 
 Held-transaction reliability: crash-only timeouts, legible reap errors, and

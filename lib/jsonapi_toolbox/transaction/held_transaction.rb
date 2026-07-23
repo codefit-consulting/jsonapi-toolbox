@@ -17,6 +17,11 @@ module JsonapiToolbox
         @hard_cap_ttl = hard_cap_ttl
         @state = "open"
         @op_count = 0
+        # True only while the held thread is inside a caller's operation block.
+        # An in-flight op is proof of liveness, so the lease must not fire while
+        # it is set. Written by the held thread, read by the reaper thread —
+        # guarded by @mutex like every other cross-thread field.
+        @busy = false
 
         # Wall-clock stamp for display/serialization only.
         @created_at = Time.now
@@ -81,6 +86,12 @@ module JsonapiToolbox
         end
       end
 
+      # True while the held thread is mid-operation. Read by the reaper to keep
+      # the lease from firing on a caller that is blocked waiting on a long op.
+      def busy?
+        @mutex.synchronize { @busy }
+      end
+
       # Seconds since the last heartbeat/op (the reaper's liveness signal).
       def idle_for
         monotonic_now - @mutex.synchronize { @last_seen_mono }
@@ -92,8 +103,12 @@ module JsonapiToolbox
       end
 
       # The caller went silent for longer than its lease → presumed dead.
+      # A transaction that is mid-operation is busy, not idle: an in-flight op
+      # proves the caller is alive and blocked waiting on it, so the lease does
+      # not fire while busy. A genuinely stuck op is still caught by the
+      # unconditional hard_cap backstop.
       def lease_expired?
-        idle_for > @lease_ttl
+        idle_for > @lease_ttl && !busy?
       end
 
       # Alive and still heartbeating, but past the absolute sanity ceiling.
@@ -161,10 +176,20 @@ module JsonapiToolbox
 
               when :execute
                 begin
+                  @mutex.synchronize { @busy = true }
                   value = ActiveRecord::Base.transaction(requires_new: true) { payload.call }
                   result_queue.push([:success, value])
                 rescue => e
                   result_queue.push([:error, Errors::OperationError.new(e, transaction_rolled_back: false)])
+                ensure
+                  # Reset the idle timer the moment the op completes (so a long
+                  # op doesn't leave the txn looking idle), then clear busy.
+                  # Order matters: refresh last_seen before dropping busy so the
+                  # reaper never sees !busy? with a stale last_seen in between.
+                  @mutex.synchronize do
+                    @last_seen_mono = monotonic_now
+                    @busy = false
+                  end
                 end
 
               when :terminate

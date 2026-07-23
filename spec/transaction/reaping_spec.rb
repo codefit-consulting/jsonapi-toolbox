@@ -113,6 +113,85 @@ RSpec.describe "Crash-only reaping" do
     end
   end
 
+  # An op that runs longer than the lease must not get its own transaction
+  # reaped mid-flight: the caller is alive and blocked waiting on it. An
+  # in-flight op is proof of liveness (the lease is shielded), but the
+  # hard_cap backstop stays unconditional so a genuinely stuck op is still
+  # caught. A latch keeps the op deterministically in-flight while we inspect.
+  describe "does not reap a held transaction that is actively executing an op" do
+    # Drives one real op on the held thread, held in-flight by `release`.
+    # Yields once the op is executing so the caller can inspect/reap, then
+    # joins after release. Returns the op's result.
+    def with_op_in_flight(txn)
+      started = Queue.new
+      release = Queue.new
+      result = nil
+      op_thread = Thread.new do
+        result = txn.execute do
+          started.push(:go)
+          release.pop
+          :op_result
+        end
+      end
+      started.pop # the op is now executing on the held thread
+      yield
+      release.push(:go)
+      op_thread.join
+      result
+    end
+
+    it "spares an op that outlives its lease, and the op completes normally" do
+      txn = manager.create(requested_lease_ttl: 10)
+      manager.stop_reaper! # drive reaping deterministically
+
+      result = with_op_in_flight(txn) do
+        # The op has been running longer than the whole lease.
+        rewind_last_seen(txn, 1000)
+
+        expect(txn.busy?).to be true
+        expect(txn.lease_expired?).to be false # busy shields the lease
+        expect(txn.reap_reason).to be_nil
+
+        manager.send(:reap_expired)
+        expect { manager.find(txn.id) }.not_to raise_error
+      end
+
+      expect(result).to eq(:op_result)
+      expect(txn.busy?).to be false
+      # Completing the op refreshes last_seen, so it's not instantly reapable.
+      expect(txn.reap_reason).to be_nil
+    end
+
+    it "still reaps a transaction that is idle with no op running (lease_expired)" do
+      txn = manager.create(requested_lease_ttl: 10)
+      manager.stop_reaper!
+      rewind_last_seen(txn, 1000)
+
+      expect(txn.busy?).to be false
+      expect(txn.reap_reason).to eq(:lease_expired)
+
+      manager.send(:reap_expired)
+      expect { manager.find(txn.id) }
+        .to raise_error(JsonapiToolbox::Transaction::Errors::ReapedError) { |e|
+          expect(e.reason).to eq(:lease_expired)
+        }
+    end
+
+    it "still reaps an op that blows the hard_cap (runaway backstop, busy notwithstanding)" do
+      txn = manager.create(requested_lease_ttl: 10, requested_hard_cap_ttl: 60)
+      manager.stop_reaper!
+
+      with_op_in_flight(txn) do
+        rewind_created(txn, 120) # past the hard cap while the op is in-flight
+
+        expect(txn.busy?).to be true
+        expect(txn.hard_cap_ttl_exceeded?).to be true
+        # busy shields the lease but NOT the hard cap.
+        expect(txn.reap_reason).to eq(:hard_cap_ttl_exceeded)
+      end
+    end
+  end
+
   describe "instrumentation" do
     it "emits transaction_reaped with reason, idle_for, age and op_count" do
       events = []
