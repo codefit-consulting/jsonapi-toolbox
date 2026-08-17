@@ -21,9 +21,17 @@ module JsonapiToolbox
       end
 
       def render_jsonapi_error(error)
+        status, body = jsonapi_error_document(error)
+        render json: merge_transaction_meta(body), status: status
+      end
+
+      # Builds the [status, body] pair for an error without rendering, so
+      # render_jsonapi_error can splice transaction metadata into every branch
+      # at a single seam (see merge_transaction_meta).
+      def jsonapi_error_document(error)
         case error
         when JsonapiToolbox::Errors::InvalidIncludeError
-          render json: {
+          [ :bad_request, {
             errors: [ {
               status: "400",
               title: "Invalid Include Parameter",
@@ -31,9 +39,9 @@ module JsonapiToolbox
                      "\n\nAllowed include parameters:\n\n#{error.allowed_includes.join("\n")}",
               source: { parameter: "include" }
             } ]
-          }, status: :bad_request
+          } ]
         when JsonapiToolbox::Errors::InvalidFieldsError
-          render json: {
+          [ :bad_request, {
             errors: [ {
               status: "400",
               title: "Invalid Fields Parameter",
@@ -41,7 +49,7 @@ module JsonapiToolbox
                      "Allowed fields: #{error.allowed_fields.join(", ")}",
               source: { parameter: "fields[#{error.resource_type}]" }
             } ]
-          }, status: :bad_request
+          } ]
         when JsonapiToolbox::Errors::ValidationError
           errors = []
           error.validation_errors.each do |validation_error|
@@ -73,7 +81,7 @@ module JsonapiToolbox
               }
             end
           end
-          render json: { errors: errors }, status: :bad_request
+          [ :bad_request, { errors: errors } ]
         when JsonapiToolbox::Errors::UnpermittedAttributeError
           errors = error.attribute_names.zip(error.pointers).map do |name, pointer|
             {
@@ -83,7 +91,7 @@ module JsonapiToolbox
               source: { pointer: pointer }
             }
           end
-          render json: { errors: errors }, status: :bad_request
+          [ :bad_request, { errors: errors } ]
         when JsonapiToolbox::Errors::UnpermittedRelationshipError
           errors = error.relationship_names.zip(error.pointers).map do |name, pointer|
             {
@@ -93,23 +101,23 @@ module JsonapiToolbox
               source: { pointer: pointer }
             }
           end
-          render json: { errors: errors }, status: :bad_request
+          [ :bad_request, { errors: errors } ]
         when JsonapiToolbox::Errors::SerializerNotFoundError
-          render json: {
+          [ :internal_server_error, {
             errors: [ {
               status: "500",
               title: "Serializer Configuration Error",
               detail: error.message
             } ]
-          }, status: :internal_server_error
+          } ]
         when JSONAPI::Parser::InvalidDocument
-          render json: {
+          [ :bad_request, {
             errors: [ {
               status: "400",
               title: "Invalid JSON:API Document",
               detail: error.message
             } ]
-          }, status: :bad_request
+          } ]
         when ActiveRecord::RecordNotFound
           if error.message.include?("::")
             if [ error.model, error.primary_key, error.id ].all?(&:present?)
@@ -121,34 +129,46 @@ module JsonapiToolbox
             detail = error.message
           end
 
-          render json: {
+          [ :not_found, {
             errors: [ {
               status: "404",
               title: "Record Not Found",
               detail: detail
             } ]
-          }, status: :not_found
+          } ]
         else
           # Handle optional ActiveInteraction errors if the gem is loaded
           if defined?(ActiveInteraction) && error.is_a?(ActiveInteraction::InvalidInteractionError)
-            render json: {
+            [ :unprocessable_entity, {
               errors: [ {
                 status: "422",
                 title: "Validation Error",
                 detail: error.message
               } ]
-            }, status: :unprocessable_entity
+            } ]
           else
             # Fallback for other errors
-            render json: {
+            [ :internal_server_error, {
               errors: [ {
                 status: "500",
                 title: "Internal Server Error",
                 detail: error.message
               } ]
-            }, status: :internal_server_error
+            } ]
           end
         end
+      end
+
+      # Splices transaction-state metadata into an error body when the request
+      # is executing against a held transaction (see TransactionAware). No-op
+      # for non-transaction requests, so stock error responses are unchanged.
+      def merge_transaction_meta(body)
+        return body unless respond_to?(:transaction_error_meta, true)
+
+        meta = transaction_error_meta
+        return body unless meta
+
+        body.merge(meta: (body[:meta] || {}).merge(meta))
       end
 
       def build_serializer_options(additional_options = {})

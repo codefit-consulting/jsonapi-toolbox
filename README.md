@@ -447,6 +447,57 @@ end
 
 When `X-Transaction-ID` is present, the block executes on the held transaction's thread inside a SAVEPOINT, and the op itself refreshes the transaction's liveness (a real op counts as a heartbeat). When absent, it executes normally. If an operation fails, the SAVEPOINT rolls back but the outer transaction stays alive — the caller can continue or rollback. If the referenced transaction was already reaped, `with_transaction_context` renders a legible reaped error (404 with `meta.transaction_reaped`) that the client turns into a typed `TransactionReaped` — see [Errors](#errors).
 
+### Error handling inside a held transaction
+
+When a block passed to `with_transaction_context` raises, its SAVEPOINT rolls
+back and the error is handed to **your app's own `rescue_from` handlers** —
+exactly as it would be outside a transaction. The gem no longer swallows
+app-level error policy for in-transaction requests (previously every in-transaction
+error was rendered by the gem, forcing a 500 for anything that wasn't
+`ActiveRecord::RecordInvalid`).
+
+The handoff mirrors Rails' own dispatch (`rescue_with_handler(error) || fallback`):
+your `rescue_from` declarations win, and anything you don't handle falls back to
+the gem's structured JSON:API renderer — so an unhandled error still gets a clean
+error document, never a dev error page.
+
+```ruby
+class Api::Internal::BaseController < ApplicationController
+  include JsonapiToolbox::Controller::TransactionAware
+
+  # Fires whether or not a transaction is active — 404 in both cases, not 500.
+  rescue_from ActiveRecord::RecordNotFound, with: :render_jsonapi_error
+
+  # Your own domain errors reach their handler in-transaction too.
+  rescue_from HotelStay::CannotDeleteWithAllocationsError, with: :render_conflict
+end
+```
+
+Because the concern is `include`d above your `rescue_from` lines, your handlers
+already outrank the gem's under Rails' last-declared-wins ordering — no config
+needed. This works identically on Rails 4.2 and 5+ (the gem relies only on
+`rescue_with_handler` being truthy when a handler matched).
+
+**Transaction metadata.** Before handing off, the gem stashes transaction state
+on `request.env` and exposes it via the public `transaction_error_meta` reader
+(`{transaction_id:, transaction_rolled_back:}`). Any handler routed through
+`render_jsonapi_error` gets it merged into the response `meta` automatically;
+custom handlers can read it directly:
+
+```ruby
+def render_conflict(error)
+  render json: {
+    errors: [{ status: "422", title: error.message, detail: error.message }],
+    meta: transaction_error_meta   # {transaction_id:, transaction_rolled_back:}
+  }, status: :unprocessable_entity
+end
+```
+
+`transaction_rolled_back: false` means only the SAVEPOINT rolled back and the
+transaction is still open, so the caller can decide whether to continue or roll
+the whole thing back; `true` means the transaction is gone. Outside a held
+transaction, `transaction_error_meta` is `nil` and error responses are unchanged.
+
 ### Client side (calling app)
 
 Define a resource pointing at the remote app:

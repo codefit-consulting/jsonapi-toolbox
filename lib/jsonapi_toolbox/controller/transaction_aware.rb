@@ -24,6 +24,20 @@ module JsonapiToolbox
 
       TRANSACTION_HEADER = "X-Transaction-ID"
 
+      # request.env slot carrying transaction-state metadata for the in-flight
+      # request. Written before an operation error is handed off to the app's
+      # rescue_from chain; read by render helpers (and available to app-level
+      # handlers) so error responses can surface transaction state.
+      TRANSACTION_META_ENV_KEY = "jsonapi_toolbox.transaction"
+
+      # Transaction-state metadata for the in-flight request, or nil when the
+      # request isn't executing against a held transaction or no operation error
+      # occurred. Public so app-level rescue_from handlers can merge it into
+      # their own responses (the gem's render_jsonapi_error does this for free).
+      def transaction_error_meta
+        request.env[TRANSACTION_META_ENV_KEY]
+      end
+
       private
 
       def transaction_id_from_request
@@ -62,7 +76,22 @@ module JsonapiToolbox
         )
         nil
       rescue JsonapiToolbox::Transaction::Errors::OperationError => e
-        render_operation_error(e, txn_id)
+        # The caller's block failed on the held transaction's thread and arrives
+        # here wrapped as an OperationError. Previously we rendered it directly,
+        # which silently overrode the host app's entire error-handling policy for
+        # every in-transaction request. Instead: stash transaction-state metadata
+        # on request.env, then hand the *original* error to the app's rescue_from
+        # chain exactly as ActionController::Rescue#process_action does
+        # (`rescue_with_handler(exception) || raise`). rescue_with_handler is
+        # truthy when a handler matched (Rails 4.2 returns true, 5+ returns the
+        # exception), nil otherwise — so an unhandled error falls back to the
+        # gem's structured renderer, keeping a jsonapi error body (+ transaction
+        # meta) for in-transaction requests instead of leaking a dev error page.
+        request.env[TRANSACTION_META_ENV_KEY] = {
+          transaction_id: txn_id,
+          transaction_rolled_back: e.transaction_rolled_back
+        }
+        rescue_with_handler(e.original_error) || render_operation_error(e, txn_id)
         nil
       end
 
@@ -125,7 +154,10 @@ module JsonapiToolbox
         http_status = original.is_a?(ActiveRecord::RecordInvalid) ? :unprocessable_entity : :internal_server_error
 
         body = {
-          errors: [{ status: status_code, detail: detail }],
+          # title mirrors detail so json_api_client's title-only harvester
+          # (errors.rb: map { |e| e['title'] }) surfaces a real message rather
+          # than falling back to a generic one — matching render_transaction_error.
+          errors: [{ status: status_code, title: detail, detail: detail }],
           meta: {
             transaction_id: txn_id,
             transaction_rolled_back: error.transaction_rolled_back
