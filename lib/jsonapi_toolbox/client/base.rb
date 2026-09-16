@@ -47,7 +47,7 @@ module JsonapiToolbox
       def self.connection(rebuild = false, &block)
         pending = Thread.current[PENDING_TRANSACTION_KEY]
         if pending && !rebuild && !block_given?
-          pending[:connection] ||= pending[:transaction_class].build_dedicated_connection
+          pending[:connection] ||= pending[:transaction_class].build_dedicated_connection(pending)
           return pending[:connection]
         end
 
@@ -56,10 +56,12 @@ module JsonapiToolbox
 
       # Builds a standalone JsonApiClient::Connection that mirrors this
       # class's shared connection_object (same site, middleware stack, and
-      # adapter) but owns its own socket pool. Used by
+      # adapter) but owns its own single socket. Used by
       # Transaction.within_transaction to give each held transaction a
-      # dedicated TCP socket for worker affinity.
-      def self.build_dedicated_connection
+      # dedicated TCP socket for worker affinity. `pending` is the block's
+      # marker hash; its transaction_class decides how long the socket may
+      # sit idle (see pin_persistent_socket!).
+      def self.build_dedicated_connection(pending)
         source = connection(true) if connection_object.nil?
         source ||= connection_object
 
@@ -71,6 +73,9 @@ module JsonapiToolbox
         dedicated = connection_class.new(options.merge(site: site))
         clone_middleware_stack(from: source, to: dedicated)
         install_request_serializer_middleware!(dedicated)
+        pin_persistent_socket!(dedicated) do
+          pending[:transaction_class].pinned_socket_idle_timeout(pending)
+        end
         dedicated
       end
 
@@ -116,31 +121,59 @@ module JsonapiToolbox
       # builders is safe.
       #
       # Faraday stores the adapter in different places across major
-      # versions: on 0.x/1.x it lives inside `@handlers` (already copied
-      # by the `handlers.replace` above), and `builder.adapter` with no
-      # args is a mutator that raises ArgumentError. On 2.x `@adapter` is
-      # a separate slot and `builder.adapter` returns the current handler,
-      # so we have to re-attach it explicitly on the destination.
+      # versions: on 0.x it lives inside `@handlers` (already copied by the
+      # `handlers.replace` below), and `builder.adapter` with no args is a
+      # mutator that raises ArgumentError. On 1.x/2.x `@adapter` is a
+      # separate slot and `builder.adapter` returns the current handler, so
+      # we have to re-attach it explicitly on the destination.
       def self.clone_middleware_stack(from:, to:)
         src_builder = from.faraday.builder
         dst_builder = to.faraday.builder
 
         dst_builder.handlers.replace(src_builder.handlers.dup)
 
-        src_adapter =
-          begin
-            src_builder.adapter
-          rescue ArgumentError
-            nil
-          end
+        src_adapter = FaradayBuilder.adapter_handler(src_builder)
         return unless src_adapter
 
-        args = src_adapter.instance_variable_get(:@args) || []
-        kwargs = src_adapter.instance_variable_get(:@kwargs) || {}
-        block = src_adapter.instance_variable_get(:@block)
-        dst_builder.adapter(src_adapter.klass, *args, **kwargs, &block)
+        FaradayBuilder.replace_adapter!(dst_builder, src_adapter, *FaradayBuilder.handler_parts(src_adapter))
       end
       private_class_method :clone_middleware_stack
+
+      # Reconfigures the dedicated connection's :net_http_persistent adapter
+      # so the socket it pins to one receiver worker actually stays pinned:
+      #
+      # - `idle_timeout` (5 s by default in net-http-persistent) becomes
+      #   whatever the block returns, re-evaluated on every request. Past
+      #   that idle time the client transparently opens a *new* socket on
+      #   the next request, which the receiver's next free worker accepts —
+      #   one that has never seen the transaction. Transaction sizes it to
+      #   the granted lease plus a grace, so the socket outlives the slot.
+      # - `pool_size: 1`, so "the pin" is exactly one socket by construction
+      #   rather than by the request serialiser happening to reuse the same
+      #   pooled connection.
+      #
+      # Both go through the adapter's config block: json_api_client's
+      # Connection calls `builder.adapter(*options)` with no block, and the
+      # Net::HTTP::Persistent instance is only built on first request.
+      # Faraday calls the block with that instance before every request,
+      # which is what lets the timeout track the lease as it is granted.
+      #
+      # No-op unless the adapter actually is NetHttpPersistent (e.g.
+      # persistent_connections disabled, or a test adapter swapped in).
+      def self.pin_persistent_socket!(conn, &idle_timeout)
+        builder = conn.faraday.builder
+        handler = FaradayBuilder.adapter_handler(builder)
+        return unless handler && handler.klass.name.to_s.end_with?("NetHttpPersistent")
+
+        args, opts, inner = FaradayBuilder.handler_parts(handler)
+        config = lambda do |http|
+          inner&.call(http)
+          http.idle_timeout = idle_timeout.call if http.respond_to?(:idle_timeout=)
+        end
+
+        FaradayBuilder.replace_adapter!(builder, handler, args, opts.merge(pool_size: 1), config)
+      end
+      private_class_method :pin_persistent_socket!
     end
   end
 end

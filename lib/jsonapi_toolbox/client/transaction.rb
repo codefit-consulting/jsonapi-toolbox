@@ -92,9 +92,11 @@ module JsonapiToolbox
 
         begin
           result = yield(LazyTransaction.new(pending))
+          quiesce_heartbeat!(pending)
           pending[:txn]&.commit!
           result
         rescue StandardError
+          quiesce_heartbeat!(pending)
           begin
             pending[:txn]&.rollback!
           rescue JsonApiClient::Errors::NotFound
@@ -106,8 +108,9 @@ module JsonapiToolbox
           end
           raise
         ensure
-          # Stop the heartbeat first so it can't fire against a slot we're
-          # tearing down, then clear markers and close the pinned connection.
+          # The heartbeat was asked to stand down before commit/rollback; now
+          # hard-stop it (backstop for non-StandardError exits), then clear
+          # markers and close the pinned connection.
           stop_heartbeat!(pending)
           Thread.current[Base::TRANSACTION_ID_KEY] = nil
           Thread.current[Base::PENDING_TRANSACTION_KEY] = nil
@@ -169,12 +172,28 @@ module JsonapiToolbox
         thread = Thread.new do
           loop do
             sleep(interval)
+            break if pending[:heartbeat_stop]
             begin
               conn.run(:post, path, headers: { TransactionIdMiddleware::HEADER => id })
-            rescue JsonApiClient::Errors::NotFound
-              break # slot gone (reaped / committed) — stop pinging
-            rescue StandardError
-              # transient failure — keep trying; the reaper covers a dead caller
+            rescue JsonapiToolbox::Client::TransactionReaped
+              break # slot reaped — the next real request surfaces the typed error
+            rescue JsonApiClient::Errors::NotFound => e
+              # A bare 404 means the receiver never heard of this id: the ping
+              # reached a worker other than the one holding the transaction, so
+              # the pinned socket was lost and re-pinned elsewhere. Nothing to
+              # retry — every later request on this connection lands there too
+              # and fails the same way. Unless we're already committing (a ping
+              # that was queued behind the commit PATCH sees a gone slot), report
+              # it so it can't be mistaken for a lease expiry.
+              report_affinity_lost(txn, e) unless pending[:heartbeat_stop]
+              break
+            rescue StandardError => e
+              # transient failure — keep trying; the reaper covers a dead
+              # caller. Logged because a connection-level failure here usually
+              # means the receiver closed the keep-alive socket first (its
+              # persistent_timeout is shorter than the heartbeat gap), and the
+              # next ping will re-pin to a random worker.
+              report_heartbeat_failure(txn, e)
             end
           end
         end
@@ -183,6 +202,18 @@ module JsonapiToolbox
         pending[:heartbeat_thread] = thread
       end
       private_class_method :start_heartbeat!
+
+      # Ask the heartbeat to stand down before commit/rollback. Killing it
+      # here instead would risk interrupting a ping mid-request, which makes
+      # net-http-persistent close the pinned socket — and the commit would
+      # then go out on a fresh one, to whichever worker accepts it. A flag
+      # lets an in-flight ping finish (the request serialiser orders the
+      # commit behind it) and the thread exit at its next wake-up; the hard
+      # kill in the ensure below is the backstop.
+      def self.quiesce_heartbeat!(pending)
+        pending[:heartbeat_stop] = true
+      end
+      private_class_method :quiesce_heartbeat!
 
       def self.stop_heartbeat!(pending)
         thread = pending[:heartbeat_thread]
@@ -200,13 +231,45 @@ module JsonapiToolbox
       # lease the receiver echoed in the create response (falling back to the
       # client's own configured default if the response omitted it).
       def self.heartbeat_interval(txn, config)
-        attrs = txn.respond_to?(:attributes) ? txn.attributes : {}
-        granted = attrs[:lease_ttl] || attrs["lease_ttl"] || config.lease_ttl_default
+        granted = granted_lease_ttl(txn) || config.lease_ttl_default
         divisor = config.heartbeat_divisor.to_f
         divisor = 1.0 if divisor <= 0
         [granted.to_f / divisor, config.heartbeat_min_interval.to_f].max
       end
       private_class_method :heartbeat_interval
+
+      # How long the worker-pinned socket may sit idle: the lease plus
+      # `pinned_socket_idle_grace`, so the socket always outlives the slot
+      # — if the receiver has reaped the transaction, the next request fails
+      # legibly instead of quietly re-pinning to another worker. Called by
+      # the adapter before every request on the dedicated connection, so it
+      # tracks the lease as granted: before materialisation it uses the
+      # lease this transaction will *request* (the only traffic in that
+      # window is the POST /transactions itself, immediately followed by the
+      # first op), afterwards the receiver's echoed grant.
+      def self.pinned_socket_idle_timeout(pending)
+        config = JsonapiToolbox::Transaction.configuration
+        grace = config.pinned_socket_idle_grace
+        unless grace.is_a?(Numeric) && grace.positive?
+          raise ArgumentError,
+            "JsonapiToolbox::Transaction pinned_socket_idle_grace must be a positive " \
+            "number of seconds, got #{grace.inspect}"
+        end
+
+        lease = granted_lease_ttl(pending[:txn]) ||
+          pending[:requested_lease_ttl] ||
+          config.requested_lease_ttl ||
+          config.lease_ttl_default
+        lease.to_f + grace.to_f
+      end
+
+      def self.granted_lease_ttl(txn)
+        return nil unless txn.respond_to?(:attributes)
+
+        attrs = txn.attributes || {}
+        attrs[:lease_ttl] || attrs["lease_ttl"]
+      end
+      private_class_method :granted_lease_ttl
 
       # Best-effort shutdown of the transaction-scoped connection's socket
       # pool. Swallows errors so a bad close never masks the caller's real
@@ -218,6 +281,54 @@ module JsonapiToolbox
         nil
       end
       private_class_method :close_dedicated_connection
+
+      # The heartbeat's ping came back "Transaction not found" — not reaped,
+      # unknown. On a multi-worker receiver that is the signature of lost
+      # worker affinity: the socket the block was pinned to went away and
+      # its replacement was accepted by a worker that never held the slot.
+      # Logs and emits `transaction_affinity_lost.jsonapi_toolbox` so apps
+      # can count it separately from genuine lease expiries.
+      def self.report_affinity_lost(txn, error)
+        txn_id = txn&.id
+
+        JsonapiToolbox::Transaction.logger&.warn(
+          "[JsonapiToolbox::Transaction] heartbeat for txn=#{txn_id || '(unknown)'} " \
+          "reached a receiver worker that does not hold it (affinity lost): " \
+          "#{error.class}: #{error.message}. The pinned keep-alive socket was " \
+          "re-opened — check lease_ttl + pinned_socket_idle_grace vs the receiver's " \
+          "persistent_timeout. Stopping heartbeat; the next request will fail."
+        )
+
+        ActiveSupport::Notifications.instrument(
+          "transaction_affinity_lost.jsonapi_toolbox",
+          transaction_id: txn_id,
+          error: error
+        )
+      rescue StandardError
+        nil
+      end
+      private_class_method :report_affinity_lost
+
+      # A heartbeat ping failed for a reason other than the slot being gone
+      # (connection reset, timeout, 5xx). The thread keeps trying, but say
+      # so: repeated entries point at a keep-alive timeout mismatch.
+      def self.report_heartbeat_failure(txn, error)
+        txn_id = txn&.id
+
+        JsonapiToolbox::Transaction.logger&.warn(
+          "[JsonapiToolbox::Transaction] heartbeat for txn=#{txn_id || '(unknown)'} " \
+          "failed: #{error.class}: #{error.message}. Retrying at next interval."
+        )
+
+        ActiveSupport::Notifications.instrument(
+          "heartbeat_failed.jsonapi_toolbox",
+          transaction_id: txn_id,
+          error: error
+        )
+      rescue StandardError
+        nil
+      end
+      private_class_method :report_heartbeat_failure
 
       # Surface rollback failures that aren't "slot already gone" — they
       # indicate a server-side slot that will sit held until its timeout.

@@ -17,11 +17,15 @@ require "jsonapi_toolbox/client/transaction_id_middleware"
 require "jsonapi_toolbox/client/transaction_reaped_middleware"
 require "jsonapi_toolbox/client/request_serializer_middleware"
 require "jsonapi_toolbox/client/lazy_transaction"
+require "jsonapi_toolbox/client/faraday_builder"
 require "jsonapi_toolbox/client/base"
 
 module JsonapiToolbox
   module Client
     class Configuration
+      # persistent_connections  use Faraday's :net_http_persistent adapter
+      #                         (keep-alive) on every connection. Required
+      #                         for multi-worker transaction affinity.
       attr_accessor :persistent_connections
 
       def initialize

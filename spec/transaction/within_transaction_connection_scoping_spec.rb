@@ -155,8 +155,8 @@ RSpec.describe "within_transaction connection scoping" do
 
     it "closes the dedicated connection on exit" do
       captured_conn = nil
-      allow(transaction_class).to receive(:build_dedicated_connection).and_wrap_original do |orig|
-        captured_conn = orig.call
+      allow(transaction_class).to receive(:build_dedicated_connection).and_wrap_original do |orig, *args|
+        captured_conn = orig.call(*args)
       end
 
       transaction_class.within_transaction { widget_class.create(name: "w") }

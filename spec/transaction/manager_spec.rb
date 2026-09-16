@@ -21,6 +21,7 @@ RSpec.describe JsonapiToolbox::Transaction::Manager do
 
   after do
     manager.reset!
+    JsonapiToolbox::Transaction.reset_configuration!
   end
 
   describe "#create" do

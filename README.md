@@ -215,7 +215,33 @@ Note that `with_headers` is scoped to the class it's called on — `V1::Hotel.wi
 
 The client uses Faraday's `:net_http_persistent` adapter for HTTP keep-alive by default. Keep-alive underpins **multi-worker transaction affinity**: when the receiving app runs under Puma/Unicorn/Passenger with multiple workers, a held transaction lives in memory on one specific worker process, and every request inside a `within_transaction` block must land on that same worker. A persistent TCP connection stays pinned to the worker that accepted it, so reusing one socket for the whole block is what makes this work.
 
-Affinity is scoped **per-transaction**, not per-resource-class. Inside a `within_transaction` block, `Transaction.within_transaction` builds one dedicated Faraday connection (own socket, own `Net::HTTP::Persistent` pool), stashes it on the current thread, and every `JsonapiToolbox::Client::Base` subclass used in the block routes through it. On block exit, the connection is closed and the thread-local is cleared. Outside the block, each subclass keeps its own connection, so normal traffic continues to load-balance across workers.
+Affinity is scoped **per-transaction**, not per-resource-class. Inside a `within_transaction` block, `Transaction.within_transaction` builds one dedicated Faraday connection (one socket — its `Net::HTTP::Persistent` pool is sized to 1), stashes it on the current thread, and every `JsonapiToolbox::Client::Base` subclass used in the block routes through it. On block exit, the connection is closed and the thread-local is cleared. Outside the block, each subclass keeps its own connection, so normal traffic continues to load-balance across workers.
+
+#### The pin is a TCP connection — keep both ends from dropping it
+
+Nothing routes a request to "the worker holding transaction X". The only thing that keeps the block on that worker is that the *same TCP socket* stays open, and a keep-alive socket is closed by whichever side's idle timeout fires first. If it closes, the client silently opens a fresh one on the next request, the receiver's next free worker `accept()`s it, and that worker has never heard of the transaction — every subsequent request 404s (`Transaction not found`) and the real worker reaps the slot once the lease lapses. The failure is clean (the caller's `within_transaction` rolls back, nothing is autocommitted on the receiver) but it is a failure, and it only bites *long* blocks with quiet gaps, so it looks like flakiness.
+
+The socket is never idle for longer than one heartbeat interval (`granted lease_ttl / heartbeat_divisor`), so both idle timeouts just have to comfortably exceed that. The rule the gem uses: **the socket outlives the slot** — it may sit idle for the granted `lease_ttl` plus a grace, i.e. until after the receiver would have reaped the transaction anyway.
+
+- **Client side** — `net-http-persistent` would drop an idle socket after **5 s** by default, shorter than the default 10 s heartbeat gap. The dedicated connection instead sets its idle timeout to `granted lease_ttl + pinned_socket_idle_grace`, re-read before every request so it follows whatever lease the receiver actually granted (per-transaction `requested_lease_ttl` included; before the grant arrives it uses the lease about to be requested). The grace defaults to **30 s** — well past the receiver's `reaper_scan_interval`, so a reaped slot always fails legibly rather than quietly re-pinning:
+
+  ```ruby
+  JsonapiToolbox::Transaction.configure do |config|
+    config.pinned_socket_idle_grace = 30  # seconds beyond the lease; must be positive
+  end
+  ```
+
+  It must be a positive number: `nil` does *not* mean "never" — `Net::HTTP` then falls back to its own 2 s `keep_alive_timeout`.
+
+- **Receiver side** — the app server's keep-alive timeout must be at least as long as the longest socket a client may hold: `lease_ttl_max + pinned_socket_idle_grace` (defaults: 120 + 30). Otherwise the receiver closes first, the client's next heartbeat POST fails (`net-http-persistent` doesn't retry non-idempotent requests on a dead socket), and the one after that re-pins at random. Puma's `persistent_timeout` defaults to **20 s**; set it in `config/puma.rb` of *every* app that hosts transactions:
+
+  ```ruby
+  persistent_timeout 150   # >= lease_ttl_max + the clients' pinned_socket_idle_grace
+  ```
+
+  (Unicorn has no keep-alive; Passenger/nginx: check `keepalive_timeout`.)
+
+When affinity is lost anyway (a rolling deploy, a worker restarted by `worker_timeout`, a conntrack reset), the heartbeat's 404 is logged as **affinity lost** and emits `transaction_affinity_lost.jsonapi_toolbox`, distinct from a genuine lease expiry — see [Observability](#observability). A heartbeat that fails for a transport reason (socket reset, timeout) is logged and emits `heartbeat_failed.jsonapi_toolbox`; a steady trickle of those points at a keep-alive mismatch between the two sides.
 
 - **Faraday 0.x:** The adapter is built-in. No extra dependencies needed.
 - **Faraday 2.x:** The adapter was extracted. Add to your Gemfile:
@@ -304,6 +330,7 @@ JsonapiToolbox::Transaction.configure do |config|
   # Client policy — used when this app *initiates* a transaction
   config.heartbeat_divisor      = 3     # heartbeats per lease window (tolerate divisor-1 misses)
   config.heartbeat_min_interval = 2     # floor, so a small lease can't cause a heartbeat storm
+  config.pinned_socket_idle_grace = 30  # pinned socket idle timeout = granted lease + this (see Persistent Connections)
   config.requested_lease_ttl    = nil   # default lease to request; also per-txn (nil → server default)
   config.requested_hard_cap_ttl = nil   # default hard_cap_ttl to request; also per-txn (nil → server default)
 end
@@ -582,14 +609,14 @@ a **monotonic** clock, so an NTP step can't cause a false reap.
 
 All transaction lifecycle operations use standard JSON:API CRUD, plus the heartbeat endpoint:
 
-| Action | Method | Path | Body |
-|--------|--------|------|------|
-| Create | POST | `/transactions` | `{data: {type: "transactions", attributes: {requested_lease_ttl: 30, requested_hard_cap_ttl: 300}}}` |
-| Show | GET | `/transactions/:id` | |
-| List | GET | `/transactions` | |
-| Heartbeat | POST | `/transactions/:id/heartbeat` | *(empty; 204 No Content on success)* |
-| Commit | PATCH | `/transactions/:id` | `{data: {type: "transactions", id: "...", attributes: {state: "committed"}}}` |
-| Rollback | PATCH | `/transactions/:id` | `{data: {type: "transactions", id: "...", attributes: {state: "rolled_back"}}}` |
+| Action    | Method | Path                          | Body                                                                                                 |
+| --------- | ------ | ----------------------------- | ---------------------------------------------------------------------------------------------------- |
+| Create    | POST   | `/transactions`               | `{data: {type: "transactions", attributes: {requested_lease_ttl: 30, requested_hard_cap_ttl: 300}}}` |
+| Show      | GET    | `/transactions/:id`           |                                                                                                      |
+| List      | GET    | `/transactions`               |                                                                                                      |
+| Heartbeat | POST   | `/transactions/:id/heartbeat` | *(empty; 204 No Content on success)*                                                                 |
+| Commit    | PATCH  | `/transactions/:id`           | `{data: {type: "transactions", id: "...", attributes: {state: "committed"}}}`                        |
+| Rollback  | PATCH  | `/transactions/:id`           | `{data: {type: "transactions", id: "...", attributes: {state: "rolled_back"}}}`                      |
 
 Create attributes are both optional: `requested_lease_ttl` and `requested_hard_cap_ttl`. Each is clamped by the receiver's policy. The create response **echoes the granted values** so the client can set its heartbeat cadence:
 
@@ -633,14 +660,16 @@ Create attributes are both optional: `requested_lease_ttl` and `requested_hard_c
 
 The gem emits plain [`ActiveSupport::Notifications`](https://api.rubyonrails.org/classes/ActiveSupport/Notifications.html) events (no metrics-library dependency — works on Rails 4.2), so each app can subscribe and export with whatever collector it can load. All events are namespaced `*.jsonapi_toolbox`:
 
-| Event | Payload | Fires |
-|-------|---------|-------|
-| `transaction_materialized.jsonapi_toolbox` | `id, lease_ttl, hard_cap_ttl` | receiver grants a new held transaction |
-| `transaction_committed.jsonapi_toolbox` | `id, op_count, duration` | commit |
-| `transaction_rolled_back.jsonapi_toolbox` | `id, op_count, duration` | explicit rollback |
-| `transaction_reaped.jsonapi_toolbox` | `id, reason, idle_for, age, op_count` | reaper tears a slot down |
-| `transaction_operation.jsonapi_toolbox` | `transaction_id, endpoint, verb, in_txn, op_count, duration` | each op run on a held transaction |
-| `rollback_failed.jsonapi_toolbox` | `transaction_id, error` | a client-side `within_transaction` rollback failed |
+| Event                                       | Payload                                                      | Fires                                                                                                                                                                |
+| ------------------------------------------- | ------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `transaction_materialized.jsonapi_toolbox`  | `id, lease_ttl, hard_cap_ttl`                                | receiver grants a new held transaction                                                                                                                               |
+| `transaction_committed.jsonapi_toolbox`     | `id, op_count, duration`                                     | commit                                                                                                                                                               |
+| `transaction_rolled_back.jsonapi_toolbox`   | `id, op_count, duration`                                     | explicit rollback                                                                                                                                                    |
+| `transaction_reaped.jsonapi_toolbox`        | `id, reason, idle_for, age, op_count`                        | reaper tears a slot down                                                                                                                                             |
+| `transaction_operation.jsonapi_toolbox`     | `transaction_id, endpoint, verb, in_txn, op_count, duration` | each op run on a held transaction                                                                                                                                    |
+| `rollback_failed.jsonapi_toolbox`           | `transaction_id, error`                                      | a client-side `within_transaction` rollback failed                                                                                                                   |
+| `transaction_affinity_lost.jsonapi_toolbox` | `transaction_id, error`                                      | a heartbeat got a bare 404 — the pinned socket was lost and re-opened on a worker that doesn't hold the slot (see [Persistent Connections](#persistent-connections)) |
+| `heartbeat_failed.jsonapi_toolbox`          | `transaction_id, error`                                      | a heartbeat failed for a transport reason; the thread keeps trying                                                                                                   |
 
 ```ruby
 # e.g. in an initializer — subscribe and forward to your metrics stack
@@ -650,7 +679,7 @@ ActiveSupport::Notifications.subscribe("transaction_reaped.jsonapi_toolbox") do 
 end
 ```
 
-The `transaction_reaped` event is the one unambiguous "caller died / budget blown" signal — a good thing to alert on.
+The `transaction_reaped` event is the one unambiguous "caller died / budget blown" signal — a good thing to alert on. `transaction_affinity_lost` is the one to watch after infrastructure changes: it means a multi-worker receiver's keep-alive socket was dropped mid-block, which a `lease_expired` reap on the receiver side would otherwise mask.
 
 ---
 
@@ -658,31 +687,31 @@ The `transaction_reaped` event is the one unambiguous "caller died / budget blow
 
 All errors are under `JsonapiToolbox::Errors` and rendered automatically by `render_jsonapi_error`:
 
-| Error | HTTP | When |
-|-------|------|------|
-| `ValidationError` | 400 | Required attributes/relationships missing, or unpermitted fields sent |
-| `InvalidIncludeError` | 400 | `?include=` contains paths not in `allowed_includes` |
-| `InvalidFieldsError` | 400 | `?fields[type]=` contains attributes not on the serializer |
-| `UnpermittedAttributeError` | 400 | Request body contains attributes not in `permitted_attributes` |
-| `UnpermittedRelationshipError` | 400 | Request body contains relationships not in `permitted_relationships` |
-| `JSONAPI::Parser::InvalidDocument` | 400 | Request body is not a valid JSON:API document |
-| `SerializerNotFoundError` | 500 | Auto-detection couldn't find a serializer for the controller |
-| `ActiveRecord::RecordNotFound` | 404 | Standard AR not-found (detail strips internal namespaces) |
+| Error                              | HTTP | When                                                                  |
+| ---------------------------------- | ---- | --------------------------------------------------------------------- |
+| `ValidationError`                  | 400  | Required attributes/relationships missing, or unpermitted fields sent |
+| `InvalidIncludeError`              | 400  | `?include=` contains paths not in `allowed_includes`                  |
+| `InvalidFieldsError`               | 400  | `?fields[type]=` contains attributes not on the serializer            |
+| `UnpermittedAttributeError`        | 400  | Request body contains attributes not in `permitted_attributes`        |
+| `UnpermittedRelationshipError`     | 400  | Request body contains relationships not in `permitted_relationships`  |
+| `JSONAPI::Parser::InvalidDocument` | 400  | Request body is not a valid JSON:API document                         |
+| `SerializerNotFoundError`          | 500  | Auto-detection couldn't find a serializer for the controller          |
+| `ActiveRecord::RecordNotFound`     | 404  | Standard AR not-found (detail strips internal namespaces)             |
 
 Transaction-specific errors are under `JsonapiToolbox::Transaction::Errors` (raised on the **receiver**):
 
-| Error | HTTP | When |
-|-------|------|------|
-| `NotFoundError` | 404 | Transaction ID never existed on this process |
-| `ReapedError` | 404 | Transaction was reaped (caller went silent, or blew `hard_cap_ttl`); carries `reason` and renders `meta.transaction_reaped` |
-| `ExpiredError` | 410 | Transaction is no longer open (already committed/rolled back) |
-| `ConcurrencyLimitError` | 429 | `max_concurrent` held transactions reached |
-| `OperationError` | 422/500 | A block executed within a held transaction raised |
+| Error                   | HTTP    | When                                                                                                                        |
+| ----------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `NotFoundError`         | 404     | Transaction ID never existed on this process                                                                                |
+| `ReapedError`           | 404     | Transaction was reaped (caller went silent, or blew `hard_cap_ttl`); carries `reason` and renders `meta.transaction_reaped` |
+| `ExpiredError`          | 410     | Transaction is no longer open (already committed/rolled back)                                                               |
+| `ConcurrencyLimitError` | 429     | `max_concurrent` held transactions reached                                                                                  |
+| `OperationError`        | 422/500 | A block executed within a held transaction raised                                                                           |
 
 On the **client**, a reaped-slot response is turned into a typed error you can rescue:
 
-| Error | Base | Carries | When |
-|-------|------|---------|------|
+| Error                                       | Base                              | Carries                    | When                                                           |
+| ------------------------------------------- | --------------------------------- | -------------------------- | -------------------------------------------------------------- |
 | `JsonapiToolbox::Client::TransactionReaped` | `JsonApiClient::Errors::NotFound` | `transaction_id`, `reason` | any request/heartbeat came back with `meta.transaction_reaped` |
 
 Because `TransactionReaped` subclasses `NotFound`, existing `rescue JsonApiClient::Errors::NotFound` paths still catch it; rescue `TransactionReaped` specifically when you want the self-describing message (it names the transaction and reason instead of string-scraping the resource URL).

@@ -1,5 +1,58 @@
 # Changelog
 
+## 0.4.1
+
+### Fixed
+
+- **Held transactions were losing worker affinity after a quiet gap.** The
+  pin to one receiver worker is a keep-alive TCP socket, and
+  `net-http-persistent` drops an idle socket after **5 s** by default — shorter
+  than the 10 s default heartbeat interval. After any quiet gap the client
+  silently opened a fresh socket, the receiver's next free worker accepted it,
+  and every later request (heartbeat, ops, commit) 404'd with
+  `Transaction not found` while the real worker reaped the slot as
+  `lease_expired`. Only long blocks with gaps between requests were affected.
+  The dedicated connection now reconfigures its adapter with `pool_size: 1`
+  and an idle timeout of **granted `lease_ttl` + `pinned_socket_idle_grace`**
+  (new `Transaction` client setting, default 30 s), re-read before every
+  request so it tracks the lease the receiver actually granted — the socket
+  always outlives the slot. Works on Faraday 0.x, 1.x and 2.x alike (the
+  version-sensitive builder surgery lives in `Client::FaradayBuilder`). The
+  receiver's keep-alive timeout has to be at least `lease_ttl_max + grace` —
+  Puma's `persistent_timeout` defaults to 20 s. See README "Persistent
+  Connections".
+- **Heartbeat no longer mistakes lost affinity for a reaped slot.** A bare
+  404 on a heartbeat now stops the thread *and* logs "affinity lost" +
+  emits `transaction_affinity_lost.jsonapi_toolbox`; only the typed
+  `TransactionReaped` is treated as "slot legitimately gone". Transport
+  failures (previously swallowed) are logged and emit
+  `heartbeat_failed.jsonapi_toolbox` while the thread keeps trying.
+- **Heartbeat stands down before commit/rollback instead of being killed
+  after.** Killing it could interrupt a ping mid-request, which makes
+  `net-http-persistent` close the pinned socket — so the commit itself would
+  have travelled on a fresh socket to a random worker. The thread is now
+  flagged to stop first (an in-flight ping completes and the commit queues
+  behind it); the hard kill on block exit remains as a backstop. A ping that
+  was queued behind the commit and sees the closed slot is not reported.
+
+### Upgrading
+
+- Set `persistent_timeout` in `config/puma.rb` of every app that **hosts**
+  transactions to at least its `lease_ttl_max` + the clients'
+  `pinned_socket_idle_grace` (defaults 120 + 30), e.g. `persistent_timeout 150`.
+
+## 0.4.0
+
+### Fixed
+
+- **In-transaction errors are handed to the host app's `rescue_from`
+  handlers.** `TransactionAware#with_transaction_context` used to catch every
+  `OperationError` raised inside a held transaction and render it via a
+  hardcoded 422/500 map, bypassing the app's error-handling policy. The
+  original error now goes through `rescue_with_handler` exactly as
+  `ActionController::Rescue` does, with transaction-state metadata stashed on
+  `request.env`; unhandled errors fall back to the gem's structured renderer.
+
 ## 0.3.1
 
 ### Fixed

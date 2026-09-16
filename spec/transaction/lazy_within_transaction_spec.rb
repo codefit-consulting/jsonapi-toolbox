@@ -267,4 +267,41 @@ RSpec.describe "Transaction.within_transaction laziness" do
       expect(Thread.current[JsonapiToolbox::Client::Base::TRANSACTION_ID_KEY]).to be_nil
     end
   end
+
+  # The heartbeat is asked to stand down *before* the closing PATCH goes out
+  # (not killed after it): a kill could interrupt a ping mid-request, which
+  # closes the pinned socket, and the commit would then travel on a fresh
+  # socket to whichever receiver worker accepts it.
+  describe "heartbeat quiesce ordering" do
+    def heartbeat_stop_seen_by_patch
+      seen = nil
+      stubs.patch("/api/transactions/txn-1") do |env|
+        seen = Thread.current[JsonapiToolbox::Client::Base::PENDING_TRANSACTION_KEY][:heartbeat_stop]
+        json_response(patch_body(env))
+      end
+      # Consume the default PATCH stub so ours answers next.
+      transaction_class.within_transaction { widget_class.create(name: "priming") }
+      yield
+      seen
+    end
+
+    it "sets heartbeat_stop before the commit PATCH" do
+      seen = heartbeat_stop_seen_by_patch do
+        transaction_class.within_transaction { widget_class.create(name: "w") }
+      end
+      expect(seen).to be true
+    end
+
+    it "sets heartbeat_stop before the rollback PATCH" do
+      seen = heartbeat_stop_seen_by_patch do
+        expect do
+          transaction_class.within_transaction do
+            widget_class.create(name: "w")
+            raise "boom"
+          end
+        end.to raise_error("boom")
+      end
+      expect(seen).to be true
+    end
+  end
 end

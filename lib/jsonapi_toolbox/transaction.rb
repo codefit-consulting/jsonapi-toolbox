@@ -41,6 +41,16 @@ module JsonapiToolbox
       # heartbeat_divisor      heartbeats per lease window → tolerate divisor-1
       #                        misses; interval = granted_ttl / divisor.
       # heartbeat_min_interval floor, so a small lease can't cause a heartbeat storm.
+      # pinned_socket_idle_grace
+      #                        seconds *beyond the granted lease* the worker-pinned
+      #                        keep-alive socket may sit idle before the client would
+      #                        silently reconnect (and land on a random receiver
+      #                        worker). Socket idle timeout = lease_ttl + grace, so it
+      #                        always outlives the slot itself (reaped at lease_ttl,
+      #                        noticed within reaper_scan_interval). The receiver's
+      #                        Puma persistent_timeout must be >= lease_ttl_max + grace.
+      #                        Must be positive: nil would leave Net::HTTP's own 2 s
+      #                        keep_alive_timeout in charge.
       # requested_lease_ttl    optional lease request (nil → server default);
       #                        also settable per-transaction via within_transaction.
       # requested_hard_cap_ttl optional hard_cap_ttl request (nil → server default);
@@ -53,6 +63,7 @@ module JsonapiToolbox
                     :hard_cap_ttl_default, :hard_cap_ttl_max,
                     :reaper_scan_interval,
                     :heartbeat_divisor, :heartbeat_min_interval,
+                    :pinned_socket_idle_grace,
                     :requested_lease_ttl, :requested_hard_cap_ttl
 
       def initialize
@@ -67,6 +78,7 @@ module JsonapiToolbox
 
         @heartbeat_divisor = 3
         @heartbeat_min_interval = 2
+        @pinned_socket_idle_grace = 30
         @requested_lease_ttl = nil
         @requested_hard_cap_ttl = nil
       end
