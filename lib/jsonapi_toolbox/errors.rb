@@ -20,13 +20,31 @@ module JsonapiToolbox
       end
     end
 
+    # A requested ?include= path that cannot be served, rendered as a 400. The
+    # message names the path up to the failing segment and says what could be
+    # included there instead.
     class InvalidIncludeError < StandardError
-      attr_reader :invalid_includes, :allowed_includes
+      attr_reader :path, :segment, :includable
 
-      def initialize(invalid_includes, allowed_includes)
-        @invalid_includes = invalid_includes
-        @allowed_includes = allowed_includes
-        super("Invalid include parameters: #{invalid_includes.join(", ")}")
+      def initialize(message, path:, segment: nil, includable: [])
+        @path = path
+        @segment = segment
+        @includable = includable
+        super(message)
+      end
+    end
+
+    # A serializer's include declarations cannot work, for example because a
+    # relationship's serializer class does not exist or its model lacks the
+    # association it loads through. Raised by verify_includes! with every
+    # problem found, and while serving a request with the one it hit. Apps
+    # leave it unrescued, so it surfaces as a 500.
+    class IncludeDeclarationError < StandardError
+      attr_reader :problems
+
+      def initialize(problems)
+        @problems = problems
+        super("Invalid include declarations:\n#{problems.map { |problem| "  - #{problem}" }.join("\n")}")
       end
     end
 

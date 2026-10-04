@@ -7,17 +7,43 @@ module JsonapiToolbox
 
       private
 
+      # Serializes `resource` with the auto-detected (or given) serializer and
+      # the validated includes and fieldsets. Before serializing, it preloads
+      # what the includes and the serializers' declarations need, unless the
+      # action passes `preload: false` because it has loaded everything itself.
       def render_jsonapi(resource, options = {})
         # Extract serializer from options or use auto-detected one
         serializer_class = options.delete(:serializer) || self.serializer_class
+        preload = options.key?(:preload) ? options.delete(:preload) : true
 
         # Build serializer options from validated parameters
         serializer_options = build_serializer_options(options)
+
+        if preload
+          serializer_options[:params] = JsonapiToolbox::Serializer::Preloader.call(
+            serializer_class,
+            resource,
+            jsonapi_include_tree(serializer_options[:include]),
+            params: serializer_options[:params],
+            is_collection: serializer_options[:is_collection]
+          )
+        end
 
         # Render using the jsonapi-serializer
         serialized_data = serializer_class.new(resource, serializer_options)
 
         render json: serialized_data.serializable_hash, status: options[:status] || :ok
+      end
+
+      # The include tree for this render: the tree that validate_includes built
+      # from the request, or the tree of an include list the action passed.
+      # Preloader checks it against the serializer actually used.
+      def jsonapi_include_tree(include_option)
+        if @validated_include_tree && include_option.equal?(@validated_includes)
+          @validated_include_tree
+        else
+          JsonapiToolbox::Serializer::IncludeTree.parse(include_option)
+        end
       end
 
       def render_jsonapi_error(error)
@@ -35,8 +61,7 @@ module JsonapiToolbox
             errors: [ {
               status: "400",
               title: "Invalid Include Parameter",
-              detail: "\nInvalid include parameters:\n\n#{error.invalid_includes.join("\n")}" \
-                     "\n\nAllowed include parameters:\n\n#{error.allowed_includes.join("\n")}",
+              detail: error.message,
               source: { parameter: "include" }
             } ]
           } ]

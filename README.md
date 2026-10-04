@@ -69,7 +69,7 @@ Each concern can be used independently:
 
 **SerializerDetection** — auto-detects the serializer class from the controller name. `PackagesController` finds `PackageSerializer` in the same namespace, with a fallback one level up (so `Api::V1::PackagesController` will try `Api::V1::PackageSerializer` then `Api::PackageSerializer`).
 
-**Validation** — registers `before_action` hooks that validate the JSON:API document structure on `create`/`update`, validate `?include=` against the serializer's `allowed_includes`, and validate `?fields[type]=` against the serializer's declared attributes.
+**Validation** — registers `before_action` hooks that validate the JSON:API document structure on `create`/`update`, check each `?include=` path against the serializers (see [Include handling](#include-handling)), and validate `?fields[type]=` against the serializer's declared attributes.
 
 **DataValidation** — the `validate_data` method (alias for `extract_and_validate_jsonapi_data`). Extracts attributes and relationships from the JSON:API request body, checks required/permitted fields, and converts relationship data to foreign keys (`{data: {type: "suppliers", id: "5"}}` becomes `supplier_id: "5"`).
 
@@ -85,7 +85,7 @@ attributes = validate_data(
 
 Has-many relationships are converted to `_ids`: `{data: [{type: "tags", id: "1"}, {type: "tags", id: "2"}]}` becomes `tag_ids: ["1", "2"]`.
 
-**Rendering** — `render_jsonapi(resource, options = {})` serializes using the auto-detected (or explicit) serializer, respecting validated includes and sparse fieldsets. `render_jsonapi_error(error)` renders JSON:API-compliant error responses for all the gem's error types, plus `ActiveRecord::RecordNotFound` and `ActiveInteraction::InvalidInteractionError` (if loaded).
+**Rendering** — `render_jsonapi(resource, options = {})` serializes using the auto-detected (or explicit) serializer, respecting validated includes and sparse fieldsets, after preloading what the includes need. `render_jsonapi_error(error)` renders JSON:API-compliant error responses for all the gem's error types, plus `ActiveRecord::RecordNotFound` and `ActiveInteraction::InvalidInteractionError` (if loaded).
 
 ### Railtie
 
@@ -105,8 +105,6 @@ class Api::V1::HotelSerializer
 
   lazy_belongs_to :supplier, serializer: Api::V1::SupplierSerializer
   lazy_has_many :room_types, serializer: Api::V1::RoomTypeSerializer
-
-  allow_includes :supplier, :room_types, recursive: true
 end
 ```
 
@@ -116,42 +114,140 @@ The JSON:API `type` is derived from the serializer class name automatically. `Ho
 
 ### Include handling
 
-`allow_includes` declares which relationships can be requested via `?include=`. The `Validation` concern validates incoming requests against this list.
+`?include=` lets a client ask for related records in the same response. The `Validation` concern checks each requested path against the serializers, one segment at a time, and `render_jsonapi` preloads every record the paths reach, so serializing them runs no further queries.
 
-```ruby
-# Simple includes
-allow_includes :supplier, :room_types
+#### Which relationships may be included
 
-# Recursive — walks the relationship tree through child serializers
-allow_includes :room_types, recursive: true
-# If RoomTypeSerializer also has `allow_includes :allocations, recursive: true`,
-# then "room_types.allocations" is automatically allowed.
-
-# Prefixed — for polymorphic or aliased relationships
-allow_includes :room_types, prefix: :standard
-# Allows "standard_room_types"
-```
-
-**Include overrides** — when the API relationship name doesn't match the ActiveRecord association:
+A serializer that says nothing lets clients include any of its relationships:
 
 ```ruby
 class HotelSerializer
   include JsonapiToolbox::Serializer::Base
 
-  lazy_has_many :room_types, serializer: RoomTypeSerializer
+  lazy_belongs_to :supplier
+  lazy_has_many :room_types
+end
 
-  allow_includes :room_types, recursive: true
+class RoomTypeSerializer
+  include JsonapiToolbox::Serializer::Base
 
-  # The API calls it "room_types" but AR needs to eager-load through a scope
-  define_include_override :room_types, { available_room_types: :allocations }
+  lazy_has_many :rates
 end
 ```
 
-`build_activerecord_includes` translates a list of API include paths into a nested hash suitable for `ActiveRecord::QueryMethods#includes`:
+A path continues through whatever the serializer at each step allows, so `?include=supplier,room_types.rates` works without any further declaration. `allow_includes` restricts a serializer to the relationships it names:
 
 ```ruby
-HotelSerializer.build_activerecord_includes(["room_types", "room_types.allocations"])
-# => { available_room_types: { allocations: {} } }
+class PublicHotelSerializer
+  include JsonapiToolbox::Serializer::Base
+
+  lazy_belongs_to :supplier
+  lazy_has_many :room_types
+
+  allow_includes :room_types
+end
+```
+
+A path may have at most `max_include_depth` segments, eight by default. Paths can follow relationships round a cycle, such as `room_types.hotel.room_types`, so this limit is also what bounds them:
+
+```ruby
+JsonapiToolbox::Serializer.configure do |config|
+  config.max_include_depth = 8
+end
+```
+
+A path that cannot be served gets a 400 that names it and lists what can be included at that point:
+
+```text
+Invalid include "room_types.views": "views" is not a relationship of room_types. Includable here: rates.
+```
+
+#### How each relationship loads
+
+By default, a relationship loads through the ActiveRecord association with its name, or with its `object_method_name` if it sets one. APIs often present a different view of the world from the models, and three options on `has_many`, `has_one` and `belongs_to` (and their `lazy_` helpers) cover the usual differences.
+
+`association:` names another association, such as the polymorphic association behind typed relationships:
+
+```ruby
+class CommentSerializer
+  include JsonapiToolbox::Serializer::Base
+
+  # Comment#post returns commentable when it is a Post
+  lazy_belongs_to :post, association: :commentable
+  lazy_belongs_to :photo, association: :commentable
+end
+```
+
+An array names a chain, for records that sit behind an intermediate record. Includes requested below the relationship are preloaded under its last step:
+
+```ruby
+lazy_has_many :wings, association: [ :property, :wings ] do |hotel|
+  hotel.property.wings
+end
+```
+
+`association: false` marks a relationship that is a plain method, such as one that returns `Current.price_list`. The gem asks the serializer for its records and preloads whatever the request names below them:
+
+```ruby
+lazy_has_one :current_price_list, serializer: :price_list, association: false
+```
+
+`preload:` adds associations that the related records always need, relative to those records:
+
+```ruby
+lazy_has_many :room_types, preload: { rates: :currency }
+```
+
+When a relationship declares none of these and its model has no association with its name, preloading raises `JsonapiToolbox::Errors::IncludeDeclarationError`. A forgotten declaration therefore cannot quietly cost one query per record. A relationship whose serializer is chosen per record, because it is polymorphic or has a block without `serializer:`, can be included, but nothing can be included below it.
+
+#### Associations that attributes read
+
+`preload_for_attributes` declares what an attribute reads, on the serializer that owns the attribute:
+
+```ruby
+class HotelSerializer
+  include JsonapiToolbox::Serializer::Base
+
+  attribute :display_name # reads brand.name and city.name
+  preload_for_attributes :display_name, [ :brand, :city ]
+end
+```
+
+These are preloaded wherever the serializer's records are serialized: as the primary records, including requests without `?include=`, and under every included relationship that uses the serializer.
+
+#### Preloading in render_jsonapi
+
+`render_jsonapi` preloads before it serializes, working one level of the include tree at a time. It takes a record, an array or a relation, and also value objects that wrap records, such as a `Data` returned by an action. Two things are worth knowing:
+
+- Association scopes are applied when the gem preloads, so set any per-request state they read, such as `Current` attributes, before rendering.
+- Preloading leaves associations that are already loaded alone. Reload a record that a service object has just saved before rendering it.
+
+An action that has already loaded everything can skip the preloading with `render_jsonapi(records, preload: false)`.
+
+Code outside a controller can preload and serialize the same way:
+
+```ruby
+tree = JsonapiToolbox::Serializer::IncludeTree.parse("supplier,room_types.rates")
+params = JsonapiToolbox::Serializer::Preloader.call(HotelSerializer, hotels, tree, params: {})
+
+HotelSerializer.new(hotels, include: %w[supplier room_types.rates], params: params).serializable_hash
+```
+
+`Preloader.call` returns the params with a record store added. While serializing, jsonapi-serializer then reuses the records the gem fetched, which matters for relationships that build new objects on every call. The gem prepends a small module to `FastJsonapi::Relationship` for this, and it does nothing when the params carry no store.
+
+#### Checking declarations
+
+`JsonapiToolbox::Serializer.verify_includes!` reports every problem it can find without loading records: `allow_includes` names that are not relationships, relationships whose serializer class cannot be resolved, and `preload_for_attributes` names that are not attributes. It raises `ArgumentError` when given no serializers or something that is not one, so a spec cannot pass by checking nothing:
+
+```ruby
+RSpec.describe "serializer include declarations" do
+  it "can serve every declared include" do
+    Rails.application.eager_load!
+    serializers = ObjectSpace.each_object(Class).select { |klass| klass < JsonapiToolbox::Serializer::Base }
+
+    expect(JsonapiToolbox::Serializer.verify_includes!(serializers)).to eq(true)
+  end
+end
 ```
 
 ### Lazy relationships
@@ -690,13 +786,15 @@ All errors are under `JsonapiToolbox::Errors` and rendered automatically by `ren
 | Error                              | HTTP | When                                                                  |
 | ---------------------------------- | ---- | --------------------------------------------------------------------- |
 | `ValidationError`                  | 400  | Required attributes/relationships missing, or unpermitted fields sent |
-| `InvalidIncludeError`              | 400  | `?include=` contains paths not in `allowed_includes`                  |
+| `InvalidIncludeError`              | 400  | `?include=` names a path that cannot be served                        |
 | `InvalidFieldsError`               | 400  | `?fields[type]=` contains attributes not on the serializer            |
 | `UnpermittedAttributeError`        | 400  | Request body contains attributes not in `permitted_attributes`        |
 | `UnpermittedRelationshipError`     | 400  | Request body contains relationships not in `permitted_relationships`  |
 | `JSONAPI::Parser::InvalidDocument` | 400  | Request body is not a valid JSON:API document                         |
 | `SerializerNotFoundError`          | 500  | Auto-detection couldn't find a serializer for the controller          |
 | `ActiveRecord::RecordNotFound`     | 404  | Standard AR not-found (detail strips internal namespaces)             |
+
+`IncludeDeclarationError`, also in `JsonapiToolbox::Errors`, reports a programming mistake to developers, so `render_jsonapi_error` does not handle it. It comes from `verify_includes!`, and from preloading when a relationship's declaration cannot work. [Include handling](#include-handling) describes both cases.
 
 Transaction-specific errors are under `JsonapiToolbox::Transaction::Errors` (raised on the **receiver**):
 

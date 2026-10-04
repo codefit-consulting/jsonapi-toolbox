@@ -1,5 +1,79 @@
 # Changelog
 
+## 0.5.0
+
+Include handling is redesigned. The gem used to expand each serializer's
+`allow_includes` declarations into a list of every allowed path, and left eager
+loading to each action. It now walks each request's include paths through the
+serializers, and `render_jsonapi` preloads every record they reach.
+
+### Changed
+
+- A serializer without `allow_includes` lets clients include every
+  relationship, and a path continues through whatever each serializer along it
+  allows. `allow_includes` takes relationship names only, and restricts a
+  serializer to them. A path may have at most `max_include_depth` segments,
+  eight by default, set with `JsonapiToolbox::Serializer.configure`. That limit
+  also bounds paths that follow a cycle of relationships.
+- `render_jsonapi` preloads before serializing, one level of the include tree
+  at a time. It loads the association behind each requested relationship and
+  the associations that attributes declare, so serializing runs no further
+  queries for them. It also works from records that are not ActiveRecord
+  models, such as value objects that wrap records. `preload: false` skips it.
+- An invalid include is a 400 whose detail names the failing segment and lists
+  what can be included at that point, by JSON:API type.
+- To reuse the records it preloaded while serializing, the gem prepends a small
+  module to jsonapi-serializer's `FastJsonapi::Relationship`. It changes nothing
+  unless the serializer params carry the gem's record store, which only
+  `render_jsonapi` and `Preloader.call` add.
+
+### Added
+
+- `association:` and `preload:` options on `has_many`, `has_one` and
+  `belongs_to`, and on their `lazy_` helpers. `association:` names another
+  association, a chain such as `[ :property, :wings ]`, or `false` for a
+  relationship that is a plain method. `preload:` adds associations that the
+  related records always need.
+- `preload_for_attributes :attribute, includes` declares the associations an
+  attribute reads.
+- `verify_includes!` on a serializer, and
+  `JsonapiToolbox::Serializer.verify_includes!(serializers)` for many at once,
+  raise `Errors::IncludeDeclarationError` listing every unusable declaration.
+- `JsonapiToolbox::Serializer::IncludeTree` and `Preloader.call`, for
+  preloading and serializing outside `render_jsonapi`.
+
+### Fixed
+
+- `?fields[type]=` for an included type no longer fails with a 500.
+- Problems in 0.4's path expansion are gone with it: allowed paths that
+  depended on which serializer was read first, declarations lost after the
+  first read, serializer subclasses that allowed nothing, and override hashes
+  that requests modified for the rest of the process.
+
+### Removed
+
+- The `recursive:` and `prefix:` options and dotted entries in
+  `allow_includes`.
+- `allowed_includes`, `build_activerecord_includes` and
+  `define_include_override`.
+
+### Upgrading
+
+- Delete `allow_includes` where clients may include every relationship;
+  otherwise reduce it to the relationship names.
+- Replace each `define_include_override` with `association:` and `preload:` on
+  the relationship. Move extras that an attribute of the related records needs
+  to `preload_for_attributes` on that serializer.
+- Delete calls to `build_activerecord_includes` and the `includes(...)` they
+  fed, and any code that rewrites include paths. Keep reloads that exist for
+  freshness, and set request state that association scopes read, such as
+  `Current` attributes, before rendering.
+- Every relationship can now be included, so each needs a serializer class
+  that resolves. A relationship with a block needs `serializer:` if clients
+  include anything below it.
+- Call `JsonapiToolbox::Serializer.verify_includes!` on every serializer from a
+  spec.
+
 ## 0.4.1
 
 ### Fixed
