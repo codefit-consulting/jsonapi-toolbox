@@ -76,6 +76,10 @@ module JsonapiToolbox
           elsif rel_data[:data].is_a?(Array)
             # has_many relationship - array of IDs
             permitted_attrs["#{rel_name.to_s.singularize}_ids"] = rel_data[:data].map { |item| item[:id] }
+          elsif rel_data.key?(:data)
+            # data: null empties a to-one relationship. A relationship object
+            # without a data key (links or meta only) changes nothing.
+            permitted_attrs["#{rel_name}_id"] = nil
           end
         end
 

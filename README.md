@@ -85,6 +85,8 @@ attributes = validate_data(
 
 Has-many relationships are converted to `_ids`: `{data: [{type: "tags", id: "1"}, {type: "tags", id: "2"}]}` becomes `tag_ids: ["1", "2"]`.
 
+A relationship sent as `{data: null}` clears the foreign key, so `{data: null}` on `region` becomes `region_id: nil`, and `{data: []}` on `tags` becomes `tag_ids: []`. A relationship that is left out, or that carries only `links` or `meta`, is left alone. A required relationship sent as null counts as present, so the model's own validations decide whether the empty value is allowed.
+
 **Rendering** — `render_jsonapi(resource, options = {})` serializes using the auto-detected (or explicit) serializer, respecting validated includes and sparse fieldsets, after preloading what the includes need. `render_jsonapi_error(error)` renders JSON:API-compliant error responses for all the gem's error types, plus `ActiveRecord::RecordNotFound` and `ActiveInteraction::InvalidInteractionError` (if loaded).
 
 ### Railtie

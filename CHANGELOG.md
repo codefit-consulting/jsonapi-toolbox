@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.5.1
+
+### Fixed
+
+- `validate_data` now clears a to-one relationship sent as `"data": null`. It
+  returns `"#{name}_id" => nil`, where it used to leave the key out, so the
+  record kept its old foreign key and the request still answered 200. A
+  relationship that is absent, or whose object has no `data` key (links or
+  meta only), still changes nothing. A to-many sent as `"data": []` already
+  gave `"#{name.singularize}_ids" => []`.
+
+  This changes what some requests do. A required relationship sent as null
+  counts as present, as before, and now sets its foreign key to nil, so the
+  model's own validations decide the response (usually a 422). The same holds
+  for a permitted relationship such as a departure's `package`.
+
+  On Rails 4.2, a body sent as plain `application/json` has its empty arrays
+  turned into nil by `deep_munge`, so an emptied to-many arrives as null and
+  is read as a to-one. Bodies sent as `application/vnd.api+json`, which is what
+  json_api_client sends, go through the gem's own parser and keep `[]`.
+
 ## 0.5.0
 
 Include handling is redesigned. The gem used to expand each serializer's
