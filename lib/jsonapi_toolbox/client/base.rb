@@ -3,6 +3,10 @@
 module JsonapiToolbox
   module Client
     class Base < JsonApiClient::Resource
+      # Sends every resource id in a request body as a JSON string, as
+      # JSON:API requires, whatever Ruby type the caller assigned.
+      prepend StringIds
+
       self.json_key_format = :underscored_key
 
       # Key for the thread-local pending-transaction marker set by

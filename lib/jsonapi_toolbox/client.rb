@@ -18,6 +18,7 @@ require "jsonapi_toolbox/client/transaction_reaped_middleware"
 require "jsonapi_toolbox/client/request_serializer_middleware"
 require "jsonapi_toolbox/client/lazy_transaction"
 require "jsonapi_toolbox/client/faraday_builder"
+require "jsonapi_toolbox/client/string_ids"
 require "jsonapi_toolbox/client/base"
 
 module JsonapiToolbox

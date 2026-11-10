@@ -309,6 +309,26 @@ end
 
 Note that `with_headers` is scoped to the class it's called on — `V1::Hotel.with_headers(...)` does **not** set headers on requests made by `V1::RoomType` inside the block. For cross-class header propagation (as the transaction system needs for `X-Transaction-ID`), use a Faraday middleware that reads from `Thread.current`; that's what `within_transaction` does internally.
 
+### Resource ids are sent as strings
+
+JSON:API requires every resource id to be a string. `json_api_client` copies whatever Ruby holds straight into the request body, so a reference built from an ActiveRecord integer id would be sent as a JSON number. `Client::Base` coerces ids to strings while the body is built. This covers the record's own id on an update and every relationship id, to-one and to-many alike, whether the relationship was assigned a resource, an array of resources, or a raw `{type:, id:}` hash:
+
+```ruby
+departure = V1::Departure.new(id: 77).tap(&:mark_as_persisted!)
+
+stay = V1::HotelStay.new(nights: 3)
+stay.departure = departure
+stay.save
+# POST body:
+# {"data": {"type": "hotel_stays",
+#           "relationships": {"departure": {"data": {"type": "departures", "id": "77"}}},
+#           "attributes": {"nights": 3}}}
+```
+
+The coercion happens on the way out only, so reading an id back in Ruby gives the type that was assigned. `departure.id` above still returns the Integer `77`, and app code that compares ids numerically keeps working.
+
+A to-one relationship assigned `nil` is still sent as `"data": null`, which is how a relationship is cleared, and an emptied to-many is still sent as `"data": []`.
+
 ### Persistent Connections
 
 The client uses Faraday's `:net_http_persistent` adapter for HTTP keep-alive by default. Keep-alive underpins **multi-worker transaction affinity**: when the receiving app runs under Puma/Unicorn/Passenger with multiple workers, a held transaction lives in memory on one specific worker process, and every request inside a `within_transaction` block must land on that same worker. A persistent TCP connection stays pinned to the worker that accepted it, so reusing one socket for the whole block is what makes this work.

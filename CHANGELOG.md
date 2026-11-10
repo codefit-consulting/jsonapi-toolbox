@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.5.2
+
+### Fixed
+
+- The client now sends every resource id in a request body as a JSON string,
+  as JSON:API requires. `json_api_client` copies whatever Ruby holds straight
+  into the body, so a reference built as `V1::Departure.new(id: 77)` used to
+  be sent as the number `77`. The fix covers the record's own id on an update
+  and every relationship id, to-one and to-many alike, whether the
+  relationship was assigned a resource, an array of resources, or a raw
+  `{type:, id:}` hash.
+
+  The coercion happens as the body is built, so a stored id keeps the type it
+  was assigned: `V1::Departure.new(id: 77).id` still returns the Integer.
+  Nothing in an app that compares ids numerically has to change.
+
+  A to-one relationship sent as `"data": null` stays null, so clearing a
+  relationship still works as it did in 0.5.1, and an emptied to-many stays
+  `[]`.
+
+  The server side is unchanged. `validate_data` already accepted string ids,
+  because ActiveRecord casts them.
+
 ## 0.5.1
 
 ### Fixed
